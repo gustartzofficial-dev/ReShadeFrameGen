@@ -1,0 +1,33 @@
+name: Build ReShade Addon
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package addon
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts
+          Get-ChildItem -Path build -Recurse -Filter "*.addon" | Copy-Item -Destination artifacts -Force
+          Get-ChildItem -Path build -Recurse -Filter "*.dll" | Copy-Item -Destination artifacts -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReShadeFrameGen-addon
+          path: artifacts/*
