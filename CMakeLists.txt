@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ReShade is used as an SDK/header dependency here.
+# Pin to v6.7.3 because ReShade 6.7.3 reports add-on API 18.
+# Building against main can request API 20+ and fail to load on current ReShade.
 # Do NOT add_subdirectory() the full ReShade project: its own CMake build expects
 # generated resources such as res/version.h, which are not needed for an add-on
 # and can break GitHub Actions checkout/configure.
@@ -12,7 +14,7 @@ include(FetchContent)
 FetchContent_Declare(
   reshade_sdk
   GIT_REPOSITORY https://github.com/crosire/reshade.git
-  GIT_TAG main
+  GIT_TAG v6.7.3
   GIT_SHALLOW TRUE
 )
 FetchContent_GetProperties(reshade_sdk)

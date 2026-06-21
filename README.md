@@ -62,3 +62,8 @@ Settings:
 - Add depth-buffer integration using ReShade's existing depth selection when available.
 - Add motion confidence visualization.
 - Add DX9/DX10 compatibility only after DX11 is stable.
+
+
+## Compatibility note
+
+This project pins the ReShade SDK headers to `v6.7.3` so the built add-on requests ReShade add-on API 18, matching ReShade 6.7.3. Building against ReShade `main` can produce an add-on that requests a newer API and fails to load with `requested API version ... is not supported`.
