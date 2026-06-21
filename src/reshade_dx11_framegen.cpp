@@ -263,7 +263,13 @@ namespace fg
             float hue = (atan2(f.y, f.x) / 6.2831853) + 0.5;
             float val = max(saturate(mag / 16.0), 0.06);
             float3 rgb = hsv2rgb(float3(hue, saturate(f.z), val));
-            return float4(rgb, 1.0);
+            // Overlay the flow on top of a dimmed game image instead of replacing it, so the
+            // scene stays visible for reference and you can never get blinded if the ReShade
+            // overlay closes. Flow paints in only where there is confident motion.
+            float3 game = texCurr.SampleLevel(smp, i.uv, 0).rgb;
+            float vizAmt = min(0.85, saturate(f.z) * saturate(mag * 0.5 + 0.15));
+            float3 outc = lerp(game * 0.6, rgb, vizAmt);
+            return float4(outc, 1.0);
         }
         float4 PSFlowSmooth(VSOut i) : SV_Target {
             float2 ts = float2(1.0 / lowW, 1.0 / lowH);
