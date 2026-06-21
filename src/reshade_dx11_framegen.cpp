@@ -11,6 +11,7 @@
 #include <d3dcompiler.h>
 #include <atomic>
 #include <algorithm>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 
@@ -39,6 +40,7 @@ namespace fg
         bool active_preview = true;
         bool visible_test = false;
         bool pace = true;          // even out present spacing (adds up to ~1 generated-frame of latency)
+        bool use_depth = false;    // depth-assisted disocclusion (only active once a depth buffer is found)
         int multiplier = 2;        // total output frames per real frame: 2 = 1 generated, 3 = 2, 4 = 3
         int present_interval = 1;
         int preview_divisor = 1;
@@ -113,7 +115,8 @@ namespace fg
         int usePyramid, smoothFlow;
         int hudProtect, fastMode;
         float strength, phase;
-        float pad[4]; // FlowCB is 80 bytes (multiple of 16) so CreateBuffer succeeds
+        int useDepth;
+        float pad[3]; // FlowCB is 80 bytes (multiple of 16) so CreateBuffer succeeds
     };
 
     const char *kShader = R"HLSL(
@@ -124,11 +127,14 @@ namespace fg
             int patchP,ds;
             int usePyramid,smoothFlow;
             int hudProtect,fastMode;
-            float strength,phase,pad2,pad3;
+            float strength,phase;
+            int useDepth;
+            float pad1,pad2,pad3;
         };
         Texture2D texPrev : register(t0);
         Texture2D texCurr : register(t1);
         Texture2D flowTex : register(t2);
+        Texture2D depthTex : register(t3);
         SamplerState smp : register(s0);
 
         struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
@@ -217,6 +223,16 @@ namespace fg
             warped = lerp(warped, nearest, occl);      // de-ghost at occlusion edges
 
             float w = conf * consist;
+            if (useDepth != 0) {
+                // Depth silhouettes are where geometry occludes/disoccludes. Distrust the
+                // warp there even when colors happen to match (catches edges the color
+                // consistency term misses).
+                float dc = depthTex.SampleLevel(smp, i.uv, 0).r;
+                float dxv = abs(depthTex.SampleLevel(smp, i.uv + float2(invW, 0), 0).r - dc);
+                float dyv = abs(depthTex.SampleLevel(smp, i.uv + float2(0, invH), 0).r - dc);
+                float edge = saturate((dxv + dyv) * 40.0);
+                w *= (1.0 - edge);
+            }
             float4 outc = lerp(plain, warped, w);
             if (hudProtect != 0) {
                 float3 d3 = abs(pc.rgb - cc.rgb);
@@ -272,6 +288,127 @@ namespace fg
         }
     }
 
+    // ----- Depth-assisted disocclusion -------------------------------------------------
+    // Ported from the FSR-injector's depth_hook, but the candidate depth buffer arrives via
+    // ReShade's bind_render_targets_and_depth_stencil event instead of a MinHook vtable patch.
+    // We keep the injector's private SRV-readable copy fallback (many games bind a depth
+    // buffer with no SHADER_RESOURCE flag, so it can't be sampled directly).
+    std::mutex g_depth_mtx;
+    ID3D11Texture2D *g_depth_cand = nullptr;       // game-owned depth texture, ref held
+    ID3D11Texture2D *g_depth_copy = nullptr;       // private SRV-readable copy
+    ID3D11ShaderResourceView *g_depth_srv = nullptr;
+    unsigned g_depth_w = 0, g_depth_h = 0;
+    DXGI_FORMAT g_depth_fmt = DXGI_FORMAT_UNKNOWN;
+    bool g_depth_readable = false;
+    UINT g_depth_best_area = 0;
+
+    bool depth_is_depth(DXGI_FORMAT f)
+    {
+        switch (f) {
+            case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT:
+            case DXGI_FORMAT_R32_TYPELESS:   case DXGI_FORMAT_D32_FLOAT:
+            case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            case DXGI_FORMAT_R16_TYPELESS:   case DXGI_FORMAT_D16_UNORM:
+                return true;
+            default: return false;
+        }
+    }
+    DXGI_FORMAT depth_copy_format(DXGI_FORMAT f)
+    {
+        switch (f) {
+            case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24G8_TYPELESS;
+            case DXGI_FORMAT_D32_FLOAT:         return DXGI_FORMAT_R32_TYPELESS;
+            case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32G8X24_TYPELESS;
+            case DXGI_FORMAT_D16_UNORM:         return DXGI_FORMAT_R16_TYPELESS;
+            default: return f;
+        }
+    }
+    DXGI_FORMAT depth_srv_format(DXGI_FORMAT f)
+    {
+        switch (f) {
+            case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT:
+                return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            case DXGI_FORMAT_R32_TYPELESS:   case DXGI_FORMAT_D32_FLOAT:
+                return DXGI_FORMAT_R32_FLOAT;
+            case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+                return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            case DXGI_FORMAT_R16_TYPELESS:   case DXGI_FORMAT_D16_UNORM:
+                return DXGI_FORMAT_R16_UNORM;
+            default: return DXGI_FORMAT_UNKNOWN;
+        }
+    }
+    void depth_release_private_locked()
+    {
+        safe_release(g_depth_srv);
+        safe_release(g_depth_copy);
+        g_depth_readable = false;
+    }
+    void depth_reset()
+    {
+        std::lock_guard<std::mutex> lk(g_depth_mtx);
+        depth_release_private_locked();
+        safe_release(g_depth_cand);
+        g_depth_w = g_depth_h = 0; g_depth_best_area = 0; g_depth_fmt = DXGI_FORMAT_UNKNOWN;
+    }
+    // Called from the bind event. Picks the largest screen-aspect depth-stencil texture.
+    void depth_consider(ID3D11Texture2D *tex)
+    {
+        D3D11_TEXTURE2D_DESC d;
+        tex->GetDesc(&d);
+        if (!(d.BindFlags & D3D11_BIND_DEPTH_STENCIL)) return;
+        if (!depth_is_depth(d.Format)) return;
+        float aspect = d.Height ? static_cast<float>(d.Width) / d.Height : 0.f;
+        if (aspect < 1.2f || aspect > 2.4f) return;   // exclude square shadow maps
+        UINT area = d.Width * d.Height;
+
+        std::lock_guard<std::mutex> lk(g_depth_mtx);
+        if (area < g_depth_best_area) return;
+        if (area == g_depth_best_area && g_depth_cand == tex) return;
+        depth_release_private_locked();
+        safe_release(g_depth_cand);
+        tex->AddRef();
+        g_depth_cand = tex; g_depth_w = d.Width; g_depth_h = d.Height; g_depth_fmt = d.Format;
+        g_depth_best_area = area;
+    }
+    bool depth_ensure_copy_locked()
+    {
+        if (!g_depth_cand || g_depth_srv) return g_depth_srv != nullptr;
+        if (!g_dev) return false;
+        D3D11_TEXTURE2D_DESC src{};
+        g_depth_cand->GetDesc(&src);
+        D3D11_TEXTURE2D_DESC cd{};
+        cd.Width = src.Width; cd.Height = src.Height; cd.MipLevels = 1; cd.ArraySize = 1;
+        cd.Format = depth_copy_format(src.Format);
+        cd.SampleDesc.Count = 1;
+        cd.Usage = D3D11_USAGE_DEFAULT;
+        cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(g_dev->CreateTexture2D(&cd, nullptr, &g_depth_copy)) || !g_depth_copy)
+            return false;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = depth_srv_format(src.Format);
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+        if (FAILED(g_dev->CreateShaderResourceView(g_depth_copy, &sd, &g_depth_srv)) || !g_depth_srv) {
+            safe_release(g_depth_copy);
+            return false;
+        }
+        g_depth_readable = true;
+        return true;
+    }
+    // Returns a sampleable depth SRV for the current frame, or null. Copies the live game
+    // depth into the private texture each call (handles MSAA-free single-sample depth only).
+    ID3D11ShaderResourceView *depth_current_srv()
+    {
+        std::lock_guard<std::mutex> lk(g_depth_mtx);
+        if (!g_depth_cand || !g_ctx) return nullptr;
+        D3D11_TEXTURE2D_DESC sd{};
+        g_depth_cand->GetDesc(&sd);
+        if (sd.SampleDesc.Count != 1) return nullptr;     // skip MSAA depth (needs resolve)
+        if (!depth_ensure_copy_locked()) return nullptr;
+        g_ctx->CopyResource(g_depth_copy, g_depth_cand);
+        return g_depth_srv;
+    }
+
     void clear_bbrtv_cache()
     {
         for (int i = 0; i < g_bbrtv_count; i++)
@@ -294,6 +431,7 @@ namespace fg
 
     void shutdown()
     {
+        depth_reset();
         release_resources();
         safe_release(g_cb); safe_release(g_blend); safe_release(g_smp);
         safe_release(g_ps_interp); safe_release(g_ps_smooth); safe_release(g_ps_flow); safe_release(g_vs);
@@ -406,6 +544,7 @@ namespace fg
             return true;
 
         release_resources();
+        depth_reset();   // resolution changed: drop the stale depth candidate, re-find next frame
         g_w = d.Width; g_h = d.Height; g_fmt = d.Format;
         unsigned ds = static_cast<unsigned>(std::clamp(g_settings.flow_downscale, kMinDS, kMaxDS));
         g_lw = std::max(1u, (g_w + ds - 1) / ds);
@@ -526,6 +665,14 @@ namespace fg
         cb.fastMode = g_settings.fast_mode ? 1 : 0;
         cb.strength = g_settings.strength;
         cb.phase = phase;
+
+        // Depth-assisted disocclusion: refresh the readable depth copy on the flow-computing
+        // phase, reuse it for the other phases (depth is identical across phases of one frame).
+        ID3D11ShaderResourceView *dsrv = nullptr;
+        if (g_settings.use_depth)
+            dsrv = compute_flow ? depth_current_srv() : g_depth_srv;
+        cb.useDepth = dsrv ? 1 : 0;
+
         g_ctx->UpdateSubresource(g_cb, 0, nullptr, &cb, 0, 0);
         g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
 
@@ -538,6 +685,7 @@ namespace fg
             if (use_smooth)
                 pass(g_flow2_rtv, static_cast<float>(g_lw), static_cast<float>(g_lh), g_ps_smooth, nullsrv, nullsrv, g_flow1_srv);
         }
+        g_ctx->PSSetShaderResources(3, 1, &dsrv);   // depthTex (t3); null when unavailable
         pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_interp,
              g_prev_srv, g_curr_srv, use_smooth ? g_flow2_srv : g_flow1_srv);
 
@@ -681,6 +829,7 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Checkbox("Experimental extra Present", &fg::g_settings.extra_present);
     ImGui::SliderInt("Frame multiplier (x)", &fg::g_settings.multiplier, 2, 4);
     ImGui::Checkbox("Pace frames (adds ~1 frame latency)", &fg::g_settings.pace);
+    ImGui::Checkbox("Depth-assisted de-ghosting", &fg::g_settings.use_depth);
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
     ImGui::Checkbox("Fast mode", &fg::g_settings.fast_mode);
     ImGui::Checkbox("Fast search", &fg::g_settings.fast_search);
@@ -699,6 +848,12 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Text("Draw attempts/success: %llu / %llu", fg::g_draw_attempts.load(), fg::g_draw_success.load());
     ImGui::Text("Flow grid: %ux%u", fg::g_lw, fg::g_lh);
     ImGui::Text("Native frame: %.2f ms | paced wait: %.2f ms", fg::g_dt_ema * 1000.0, fg::g_paced_ms);
+    if (fg::g_settings.use_depth) {
+        if (fg::g_depth_cand)
+            ImGui::Text("Depth: %ux%u %s", fg::g_depth_w, fg::g_depth_h, fg::g_depth_readable ? "(readable)" : "(found, copying)");
+        else
+            ImGui::Text("Depth: searching for scene buffer...");
+    }
     ImGui::TextDisabled("Preview mode writes into the current backbuffer. Extra Present attempts real generated-frame presentation and is experimental.");
 }
 
@@ -716,6 +871,26 @@ static void on_reshade_present(reshade::api::effect_runtime *runtime)
     fg::run(runtime);
 }
 
+// ReShade fires this for every render-target/depth bind (its addon-API stand-in for
+// OMSetRenderTargets). We use it to discover the scene depth buffer for disocclusion.
+static void on_bind_rtv_dsv(reshade::api::command_list *cmd_list, uint32_t, const reshade::api::resource_view *, reshade::api::resource_view dsv)
+{
+    if (!fg::g_settings.use_depth || dsv.handle == 0)
+        return;
+    reshade::api::device *dev = cmd_list->get_device();
+    if (dev == nullptr || dev->get_api() != reshade::api::device_api::d3d11)
+        return;
+    reshade::api::resource res = dev->get_resource_from_view(dsv);
+    if (res.handle == 0)
+        return;
+    ID3D11Resource *native = reinterpret_cast<ID3D11Resource *>(static_cast<uintptr_t>(res.handle));
+    ID3D11Texture2D *tex = nullptr;
+    if (native && SUCCEEDED(native->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex))) && tex) {
+        fg::depth_consider(tex);
+        tex->Release();
+    }
+}
+
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID)
 {
     switch (reason)
@@ -725,11 +900,13 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID)
         if (!reshade::register_addon(hinstDLL))
             return FALSE;
         reshade::register_event<reshade::addon_event::reshade_present>(&on_reshade_present);
+        reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&on_bind_rtv_dsv);
         reshade::register_overlay(nullptr, &draw_settings_overlay);
         reshade::register_overlay("OSD", &draw_osd_overlay);
         break;
     case DLL_PROCESS_DETACH:
         reshade::unregister_event<reshade::addon_event::reshade_present>(&on_reshade_present);
+        reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&on_bind_rtv_dsv);
         fg::shutdown();
         reshade::unregister_addon(hinstDLL);
         break;
