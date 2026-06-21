@@ -4,7 +4,7 @@ Experimental ReShade add-on that ports the DX11 frame generation research path f
 
 ## Current status
 
-This is a first side-project foundation, not a production FSR3 replacement yet.
+This is a first side-project foundation, not a production FSR3 replacement yet. This build adds a safer performance-first preview path because full optical flow inside ReShade can be very expensive.
 
 It currently does:
 
@@ -45,6 +45,10 @@ Settings:
 - Smooth flow
 - HUD/static-region protection
 - Strength
+- Fast mode
+- Fast search
+- Flow downscale
+- Preview every N frames
 - Debug overlay
 
 ## Suggested test process
@@ -67,3 +71,16 @@ Settings:
 ## Compatibility note
 
 This project pins the ReShade SDK headers to `v6.7.3` so the built add-on requests ReShade add-on API 18, matching ReShade 6.7.3. Building against ReShade `main` can produce an add-on that requests a newer API and fails to load with `requested API version ... is not supported`.
+
+
+## Performance notes
+
+If enabling preview tanks FPS, start with:
+
+- Fast mode: on
+- Fast search: on
+- Smooth flow: off
+- Flow downscale: 24 or 32
+- Preview every N frames: 2 or 3
+
+This add-on currently runs optical-flow preview inside ReShade, so it is not expected to behave like true extra-present FSR3 yet. The immediate goal is a fast stable motion-preview path before experimenting with generated-present insertion.

@@ -26,10 +26,14 @@ namespace fg
     {
         bool enabled = false;
         bool pyramid = true;
-        bool smooth = true;
+        bool smooth = false;
         bool hud_protect = true;
         bool debug_overlay = true;
-        float strength = 1.0f;
+        bool fast_mode = true;
+        int preview_divisor = 1;
+        int flow_downscale = 24;
+        int fast_search = 1;
+        float strength = 0.75f;
     };
 
     Settings g_settings;
@@ -62,7 +66,8 @@ namespace fg
     unsigned g_w = 0, g_h = 0, g_lw = 0, g_lh = 0;
     DXGI_FORMAT g_fmt = DXGI_FORMAT_UNKNOWN;
 
-    constexpr int kDS = 8;
+    constexpr int kMinDS = 8;
+    constexpr int kMaxDS = 32;
 
     struct FlowCB
     {
@@ -71,7 +76,7 @@ namespace fg
         int searchR, searchS;
         int patchP, ds;
         int usePyramid, smoothFlow;
-        int hudProtect, pad0;
+        int hudProtect, fastMode;
         float strength, pad1, pad2, pad3;
     };
 
@@ -115,10 +120,11 @@ namespace fg
             float bestSad = 1e20;
 
             if (usePyramid != 0) {
-                [unroll] for (int lvl = 0; lvl < 3; lvl++) {
-                    float stepPx = (lvl == 0) ? 8.0 : ((lvl == 1) ? 3.0 : 1.0);
-                    float spreadPx = (lvl == 0) ? (ds * 2.0) : ((lvl == 1) ? (float)ds : (ds * 0.5));
-                    int rng = (lvl == 0) ? 2 : 1;
+                int levels = (fastMode != 0) ? 2 : 3;
+                [loop] for (int lvl = 0; lvl < levels; lvl++) {
+                    float stepPx = (lvl == 0) ? ((fastMode != 0) ? 6.0 : 8.0) : ((lvl == 1) ? ((fastMode != 0) ? 2.0 : 3.0) : 1.0);
+                    float spreadPx = (lvl == 0) ? (ds * ((fastMode != 0) ? 1.25 : 2.0)) : ((lvl == 1) ? (float)ds : (ds * 0.5));
+                    int rng = (fastMode != 0) ? 1 : ((lvl == 0) ? 2 : 1);
                     float bSad = 1e20;
                     float2 bO = flowPx;
                     [loop] for (int oy = -rng; oy <= rng; oy++)
@@ -131,8 +137,8 @@ namespace fg
                     bestSad = bSad;
                 }
             } else {
-                [loop] for (int oy = -12; oy <= 12; oy += 2)
-                [loop] for (int ox = -12; ox <= 12; ox += 2) {
+                [loop] for (int oy = -8; oy <= 8; oy += 4)
+                [loop] for (int ox = -8; ox <= 8; ox += 4) {
                     float2 candPx = float2(ox, oy);
                     float sad = sad_at(cuv, candPx, ds);
                     if (sad < bestSad) { bestSad = sad; flowPx = candPx; }
@@ -304,15 +310,16 @@ namespace fg
 
         release_resources();
         g_w = d.Width; g_h = d.Height; g_fmt = d.Format;
-        g_lw = std::max(1u, (g_w + kDS - 1) / kDS);
-        g_lh = std::max(1u, (g_h + kDS - 1) / kDS);
+        unsigned ds = static_cast<unsigned>(std::clamp(g_settings.flow_downscale, kMinDS, kMaxDS));
+        g_lw = std::max(1u, (g_w + ds - 1) / ds);
+        g_lh = std::max(1u, (g_h + ds - 1) / ds);
 
         if (!make_capture(d, &g_prev_tex, &g_prev_srv)) return false;
         if (!make_capture(d, &g_curr_tex, &g_curr_srv)) return false;
         if (!make_flow(&g_flow1, &g_flow1_rtv, &g_flow1_srv)) return false;
         if (!make_flow(&g_flow2, &g_flow2_rtv, &g_flow2_srv)) return false;
 
-        log_debug("resources %ux%u flow=%ux%u", g_w, g_h, g_lw, g_lh);
+        log_debug("resources %ux%u flow=%ux%u ds=%u", g_w, g_h, g_lw, g_lh, ds);
         return true;
     }
 
@@ -399,10 +406,11 @@ namespace fg
         cb.W = g_w; cb.H = g_h; cb.lowW = g_lw; cb.lowH = g_lh;
         cb.invW = 1.0f / static_cast<float>(g_w);
         cb.invH = 1.0f / static_cast<float>(g_h);
-        cb.searchR = 12; cb.searchS = 2; cb.patchP = 1; cb.ds = kDS;
+        cb.searchR = g_settings.fast_search ? 8 : 12; cb.searchS = g_settings.fast_search ? 4 : 2; cb.patchP = 1; cb.ds = std::clamp(g_settings.flow_downscale, kMinDS, kMaxDS);
         cb.usePyramid = g_settings.pyramid ? 1 : 0;
         cb.smoothFlow = g_settings.smooth ? 1 : 0;
         cb.hudProtect = g_settings.hud_protect ? 1 : 0;
+        cb.fastMode = g_settings.fast_mode ? 1 : 0;
         cb.strength = g_settings.strength;
         g_ctx->UpdateSubresource(g_cb, 0, nullptr, &cb, 0, 0);
         g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
@@ -422,7 +430,7 @@ namespace fg
 
     void run(reshade::api::effect_runtime *runtime)
     {
-        g_real_frames.fetch_add(1, std::memory_order_relaxed);
+        const unsigned long long frame_index = g_real_frames.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!g_settings.enabled) {
             g_have_prev = false;
             return;
@@ -443,8 +451,11 @@ namespace fg
 
         g_ctx->CopyResource(g_curr_tex, bb);
         if (g_have_prev) {
-            draw_interpolated(bb);
-            g_gen_frames.fetch_add(1, std::memory_order_relaxed);
+            int div = std::max(1, g_settings.preview_divisor);
+            if ((frame_index % static_cast<unsigned long long>(div)) == 0) {
+                draw_interpolated(bb);
+                g_gen_frames.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         std::swap(g_prev_tex, g_curr_tex);
         std::swap(g_prev_srv, g_curr_srv);
@@ -456,13 +467,19 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
 {
     ImGui::Checkbox("Enable framegen preview", &fg::g_settings.enabled);
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
+    ImGui::Checkbox("Fast mode", &fg::g_settings.fast_mode);
+    ImGui::Checkbox("Fast search", &fg::g_settings.fast_search);
     ImGui::Checkbox("Smooth flow", &fg::g_settings.smooth);
     ImGui::Checkbox("HUD/static protection", &fg::g_settings.hud_protect);
+    bool changed_ds = ImGui::SliderInt("Flow downscale", &fg::g_settings.flow_downscale, 8, 32);
+    ImGui::SliderInt("Preview every N frames", &fg::g_settings.preview_divisor, 1, 4);
     ImGui::SliderFloat("Strength", &fg::g_settings.strength, 0.0f, 1.0f);
+    if (changed_ds) fg::release_resources();
     ImGui::Checkbox("Debug overlay", &fg::g_settings.debug_overlay);
     ImGui::Text("Real frames: %llu", fg::g_real_frames.load());
     ImGui::Text("Interpolated frames: %llu", fg::g_gen_frames.load());
-    ImGui::TextDisabled("Safe preview mode: no extra Present insertion yet.");
+    ImGui::Text("Flow grid: %ux%u", fg::g_lw, fg::g_lh);
+    ImGui::TextDisabled("Preview writes one interpolated frame into the current backbuffer. No extra Present yet.");
 }
 
 static void draw_osd_overlay(reshade::api::effect_runtime *)
