@@ -45,6 +45,7 @@ namespace fg
         bool effects_once = true;  // skip ReShade's effect chain on injected frames (they inherit it from the real frames)
         bool aa = false;           // depth-aware spatial edge AA (experimental; adds a full-screen pass)
         float aa_strength = 0.6f;  // AA blend amount (0..1)
+        bool debug_flow_view = false; // show the optical-flow field as false color (diagnostic)
         int multiplier = 2;        // total output frames per real frame: 2 = 1 generated, 3 = 2, 4 = 3
         int present_interval = 1;
         int preview_divisor = 1;
@@ -85,6 +86,7 @@ namespace fg
     ID3D11PixelShader *g_ps_smooth = nullptr;
     ID3D11PixelShader *g_ps_interp = nullptr;
     ID3D11PixelShader *g_ps_aa = nullptr;
+    ID3D11PixelShader *g_ps_flowviz = nullptr;
     ID3D11SamplerState *g_smp = nullptr;
     ID3D11BlendState *g_blend = nullptr;
     ID3D11Buffer *g_cb = nullptr;
@@ -207,8 +209,33 @@ namespace fg
                     if (sad < bestSad) { bestSad = sad; flowPx = candPx; }
                 }
             }
-            float conf = saturate(1.0 - bestSad / 1.5);
+            // Confidence must reflect both match quality AND local structure: a low SAD in a
+            // flat region is meaningless (aperture problem), so weight it by how much luma
+            // actually varies locally. Downstream (de-ghosting, the future accumulator) relies
+            // on this number, so it must not be falsely high on flat areas.
+            float matchConf = saturate(1.0 - bestSad / 1.5);
+            float l0 = luma(texCurr.SampleLevel(smp, cuv, 0).rgb);
+            float lx = luma(texCurr.SampleLevel(smp, cuv + float2(invW, 0) * ds, 0).rgb);
+            float ly = luma(texCurr.SampleLevel(smp, cuv + float2(0, invH) * ds, 0).rgb);
+            float structure = saturate((abs(lx - l0) + abs(ly - l0)) * 8.0);
+            float conf = matchConf * structure;
             return float4(flowPx, conf, 1);
+        }
+
+        // False-color visualization of the flow field for debugging: hue = motion direction,
+        // brightness = speed, saturation = confidence. Gray/dim = still or untrusted.
+        float3 hsv2rgb(float3 c) {
+            float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+            float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
+            return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
+        }
+        float4 PSFlowViz(VSOut i) : SV_Target {
+            float4 f = flowTex.SampleLevel(smp, i.uv, 0);
+            float mag = length(f.xy);
+            float hue = (atan2(f.y, f.x) / 6.2831853) + 0.5;
+            float val = max(saturate(mag / 16.0), 0.06);
+            float3 rgb = hsv2rgb(float3(hue, saturate(f.z), val));
+            return float4(rgb, 1.0);
         }
         float4 PSFlowSmooth(VSOut i) : SV_Target {
             float2 ts = float2(1.0 / lowW, 1.0 / lowH);
@@ -502,7 +529,7 @@ namespace fg
         depth_reset();
         release_resources();
         safe_release(g_cb); safe_release(g_blend); safe_release(g_smp);
-        safe_release(g_ps_interp); safe_release(g_ps_smooth); safe_release(g_ps_flow); safe_release(g_ps_aa); safe_release(g_vs);
+        safe_release(g_ps_interp); safe_release(g_ps_smooth); safe_release(g_ps_flow); safe_release(g_ps_aa); safe_release(g_ps_flowviz); safe_release(g_vs);
         safe_release(g_ctx); safe_release(g_dev);
         g_pipeline_ready = false;
     }
@@ -551,6 +578,11 @@ namespace fg
         if (compile_one("PSAA", "ps_5_0", &pa) && pa) {
             g_dev->CreatePixelShader(pa->GetBufferPointer(), pa->GetBufferSize(), nullptr, &g_ps_aa);
             safe_release(pa);
+        }
+        ID3DBlob *pv = nullptr;
+        if (compile_one("PSFlowViz", "ps_5_0", &pv) && pv) {
+            g_dev->CreatePixelShader(pv->GetBufferPointer(), pv->GetBufferSize(), nullptr, &g_ps_flowviz);
+            safe_release(pv);
         }
 
         D3D11_SAMPLER_DESC sd{};
@@ -715,7 +747,7 @@ namespace fg
         return rtv;
     }
 
-    bool draw_interpolated(ID3D11Texture2D *backbuffer, float phase = 0.5f, bool compute_flow = true)
+    bool draw_interpolated(ID3D11Texture2D *backbuffer, float phase = 0.5f, bool compute_flow = true, bool viz = false)
     {
         g_draw_attempts.fetch_add(1, std::memory_order_relaxed);
         ID3D11RenderTargetView *bbrtv = get_bb_rtv(backbuffer);
@@ -762,8 +794,13 @@ namespace fg
                 pass(g_flow2_rtv, static_cast<float>(g_lw), static_cast<float>(g_lh), g_ps_smooth, nullsrv, nullsrv, g_flow1_srv);
         }
         g_ctx->PSSetShaderResources(3, 1, &dsrv);   // depthTex (t3); null when unavailable
-        pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_interp,
-             g_prev_srv, g_curr_srv, use_smooth ? g_flow2_srv : g_flow1_srv);
+        if (viz && g_ps_flowviz) {
+            pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_flowviz,
+                 nullsrv, nullsrv, use_smooth ? g_flow2_srv : g_flow1_srv);
+        } else {
+            pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_interp,
+                 g_prev_srv, g_curr_srv, use_smooth ? g_flow2_srv : g_flow1_srv);
+        }
 
         ID3D11ShaderResourceView *nulls[4] = { nullptr, nullptr, nullptr, nullptr };
         g_ctx->PSSetShaderResources(0, 4, nulls);
@@ -924,7 +961,11 @@ namespace fg
         double wait_total = 0.0;
 
         if (g_have_prev) {
-            if (g_settings.extra_present) {
+            if (g_settings.debug_flow_view) {
+                // Diagnostic: paint the flow field onto the real frame and skip generation.
+                draw_interpolated(bb, 0.5f, true, true);
+                g_status = "flow debug view";
+            } else if (g_settings.extra_present) {
                 int mult = std::clamp(g_settings.multiplier, 2, 4);
                 int gens = mult - 1;
                 // Software pacing is the only thing that spreads the back-to-back generated/real
@@ -993,6 +1034,7 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Checkbox("Depth-aware AA (experimental, costs a pass)", &fg::g_settings.aa);
     if (fg::g_settings.aa)
         ImGui::SliderFloat("AA strength", &fg::g_settings.aa_strength, 0.0f, 1.0f);
+    ImGui::Checkbox("Flow debug view (false-color motion field)", &fg::g_settings.debug_flow_view);
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
     ImGui::Checkbox("Fast mode", &fg::g_settings.fast_mode);
     ImGui::Checkbox("Fast search", &fg::g_settings.fast_search);
