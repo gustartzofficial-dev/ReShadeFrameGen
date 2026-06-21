@@ -47,6 +47,8 @@ namespace fg
         float aa_strength = 0.6f;  // AA blend amount (0..1)
         bool debug_flow_view = false; // show the optical-flow field as false color (diagnostic)
         bool flow_edge_aware = true;  // joint-bilateral flow upsampling (de-blockifies motion edges)
+        bool accumulate = false;      // temporal reconstruction (back-projection); experimental, feedback loop
+        float accum_feedback = 0.85f; // max history weight per frame (0..0.95)
         int multiplier = 2;        // total output frames per real frame: 2 = 1 generated, 3 = 2, 4 = 3
         int present_interval = 1;
         int preview_divisor = 1;
@@ -88,6 +90,7 @@ namespace fg
     ID3D11PixelShader *g_ps_interp = nullptr;
     ID3D11PixelShader *g_ps_aa = nullptr;
     ID3D11PixelShader *g_ps_flowviz = nullptr;
+    ID3D11PixelShader *g_ps_accum = nullptr;
     ID3D11SamplerState *g_smp = nullptr;
     ID3D11BlendState *g_blend = nullptr;
     ID3D11Buffer *g_cb = nullptr;
@@ -140,7 +143,7 @@ namespace fg
         int useDepth;
         float aaBlend;
         int useEdgeFlow;
-        float pad; // FlowCB is 80 bytes (multiple of 16) so CreateBuffer succeeds
+        float accumFeedback; // FlowCB is 80 bytes (multiple of 16) so CreateBuffer succeeds
     };
 
     const char *kShader = R"HLSL(
@@ -155,7 +158,7 @@ namespace fg
             int useDepth;
             float aaBlend;
             int useEdgeFlow;
-            float pad3;
+            float accumFeedback;
         };
         Texture2D texPrev : register(t0);
         Texture2D texCurr : register(t1);
@@ -323,6 +326,39 @@ namespace fg
                 outc.rgb = lerp(outc.rgb, cc.rgb, staticMask);
             }
             return outc;
+        }
+
+        // Temporal reconstruction (online back-projection). texPrev (t0) = previous reconstructed
+        // frame = the history; texCurr (t1) = raw current frame; flow (t2); depth (t3).
+        // Reproject history along the flow, clamp it to the current local neighborhood (so a bad
+        // vector can't smear), then blend toward it by a confidence-weighted feedback factor.
+        // Over several frames the sub-pixel motion integrates extra samples -> sharper, stabler.
+        float4 PSAccum(VSOut i) : SV_Target {
+            float3 cur = texCurr.SampleLevel(smp, i.uv, 0).rgb;
+            float4 f = fetchFlow(i.uv);
+            float2 mv = f.xy * float2(invW, invH);
+            float3 hist = texPrev.SampleLevel(smp, i.uv + mv, 0).rgb;   // reproject history
+
+            // Variance clamp against the 3x3 current neighborhood.
+            float3 nmin = cur, nmax = cur;
+            [unroll] for (int y = -1; y <= 1; y++)
+            [unroll] for (int x = -1; x <= 1; x++) {
+                float3 s = texCurr.SampleLevel(smp, i.uv + float2(x * invW, y * invH), 0).rgb;
+                nmin = min(nmin, s); nmax = max(nmax, s);
+            }
+            float3 histC = clamp(hist, nmin, nmax);
+
+            // Confidence: flow trust x photometric agreement x depth-edge guard.
+            float resid = length(cur - histC);
+            float w = saturate(f.z) * saturate(1.0 - resid * 3.0);
+            if (useDepth != 0) {
+                float dc = depthTex.SampleLevel(smp, i.uv, 0).r;
+                float de = abs(depthTex.SampleLevel(smp, i.uv + float2(invW, 0), 0).r - dc)
+                         + abs(depthTex.SampleLevel(smp, i.uv + float2(0, invH), 0).r - dc);
+                w *= (1.0 - saturate(de * 40.0));
+            }
+            w *= saturate(accumFeedback);                  // cap on how much history we keep
+            return float4(lerp(cur, histC, w), 1.0);
         }
 
         // Depth-aware spatial edge AA. Source frame is bound to texPrev (t0); depth to t3.
@@ -563,7 +599,7 @@ namespace fg
         depth_reset();
         release_resources();
         safe_release(g_cb); safe_release(g_blend); safe_release(g_smp);
-        safe_release(g_ps_interp); safe_release(g_ps_smooth); safe_release(g_ps_flow); safe_release(g_ps_aa); safe_release(g_ps_flowviz); safe_release(g_vs);
+        safe_release(g_ps_interp); safe_release(g_ps_smooth); safe_release(g_ps_flow); safe_release(g_ps_aa); safe_release(g_ps_flowviz); safe_release(g_ps_accum); safe_release(g_vs);
         safe_release(g_ctx); safe_release(g_dev);
         g_pipeline_ready = false;
     }
@@ -617,6 +653,11 @@ namespace fg
         if (compile_one("PSFlowViz", "ps_5_0", &pv) && pv) {
             g_dev->CreatePixelShader(pv->GetBufferPointer(), pv->GetBufferSize(), nullptr, &g_ps_flowviz);
             safe_release(pv);
+        }
+        ID3DBlob *pac = nullptr;
+        if (compile_one("PSAccum", "ps_5_0", &pac) && pac) {
+            g_dev->CreatePixelShader(pac->GetBufferPointer(), pac->GetBufferSize(), nullptr, &g_ps_accum);
+            safe_release(pac);
         }
 
         D3D11_SAMPLER_DESC sd{};
@@ -958,6 +999,60 @@ namespace fg
         restore(s);
     }
 
+    // Temporal reconstruction step. g_curr_tex must already hold the raw current frame and
+    // g_prev_tex the previous reconstructed frame (the history). Computes flow, runs the
+    // back-projection accumulator into the backbuffer, and leaves flow in g_flow1/g_flow2 for
+    // the frame-gen passes to reuse. The caller copies the result back into g_curr_tex so the
+    // reconstruction both displays and feeds the next frame's history and the interpolation.
+    void apply_accumulator(ID3D11Texture2D *backbuffer)
+    {
+        if (!g_ps_accum)
+            return;
+        ID3D11RenderTargetView *bbrtv = get_bb_rtv(backbuffer);
+        if (!bbrtv)
+            return;
+
+        StateBlock s;
+        save(s);
+        const FLOAT bf[4] = {0, 0, 0, 0};
+        g_ctx->OMSetBlendState(g_blend, bf, 0xffffffff);
+        g_ctx->IASetInputLayout(nullptr);
+        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_ctx->VSSetShader(g_vs, nullptr, 0);
+        g_ctx->PSSetSamplers(0, 1, &g_smp);
+
+        FlowCB cb{};
+        cb.W = g_w; cb.H = g_h; cb.lowW = g_lw; cb.lowH = g_lh;
+        cb.invW = 1.0f / static_cast<float>(g_w);
+        cb.invH = 1.0f / static_cast<float>(g_h);
+        cb.searchR = g_settings.fast_search ? 8 : 12; cb.searchS = g_settings.fast_search ? 4 : 2;
+        cb.patchP = 1; cb.ds = std::clamp(g_settings.flow_downscale, kMinDS, kMaxDS);
+        cb.usePyramid = g_settings.pyramid ? 1 : 0;
+        cb.smoothFlow = g_settings.smooth ? 1 : 0;
+        cb.fastMode = g_settings.fast_mode ? 1 : 0;
+        cb.useEdgeFlow = g_settings.flow_edge_aware ? 1 : 0;
+        cb.accumFeedback = g_settings.accum_feedback;
+        ID3D11ShaderResourceView *dsrv = g_settings.use_depth ? depth_current_srv() : nullptr;
+        cb.useDepth = dsrv ? 1 : 0;
+        g_ctx->UpdateSubresource(g_cb, 0, nullptr, &cb, 0, 0);
+        g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
+
+        ID3D11ShaderResourceView *nullsrv = nullptr;
+        bool use_smooth = g_settings.smooth;
+        pass(g_flow1_rtv, static_cast<float>(g_lw), static_cast<float>(g_lh), g_ps_flow, g_prev_srv, g_curr_srv, nullsrv);
+        if (use_smooth)
+            pass(g_flow2_rtv, static_cast<float>(g_lw), static_cast<float>(g_lh), g_ps_smooth, nullsrv, nullsrv, g_flow1_srv);
+
+        g_ctx->PSSetShaderResources(3, 1, &dsrv);
+        // t0 = history (previous reconstructed), t1 = raw current, t2 = flow
+        pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_accum,
+             g_prev_srv, g_curr_srv, use_smooth ? g_flow2_srv : g_flow1_srv);
+
+        ID3D11ShaderResourceView *nulls[4] = { nullptr, nullptr, nullptr, nullptr };
+        g_ctx->PSSetShaderResources(0, 4, nulls);
+        restore(s);
+    }
+
     void run(reshade::api::effect_runtime *runtime)
     {
         if (g_inside_extra_present)
@@ -982,7 +1077,16 @@ namespace fg
 
         if (g_settings.aa)
             apply_aa(bb);            // AA the real frame first so generated frames inherit it
-        g_ctx->CopyResource(g_curr_tex, bb);
+        g_ctx->CopyResource(g_curr_tex, bb);   // raw current frame
+
+        // Temporal reconstruction: rebuild the real frame from history before anything reads it,
+        // so both the displayed frame and the interpolated frames inherit it. Leaves flow ready.
+        bool flow_ready = false;
+        if (g_settings.accumulate && g_have_prev && !g_settings.debug_flow_view) {
+            apply_accumulator(bb);
+            g_ctx->CopyResource(g_curr_tex, bb);   // reconstructed -> feeds FG and next history
+            flow_ready = true;
+        }
 
         // Track the native frame interval (callback-to-callback minus the time we spent pacing
         // last frame), so the pacer schedules against the game's real cadence, not its own waits.
@@ -1023,7 +1127,7 @@ namespace fg
                         g_slot += spacing;
                     }
                     float t = static_cast<float>(k) / static_cast<float>(mult);
-                    if (present_generated_frame(runtime, bb, t, k == 1))
+                    if (present_generated_frame(runtime, bb, t, k == 1 && !flow_ready))
                         g_gen_frames.fetch_add(1, std::memory_order_relaxed);
                 }
                 if (do_pace) {
@@ -1035,7 +1139,7 @@ namespace fg
             } else {
                 int div = std::max(1, g_settings.preview_divisor);
                 if ((frame_index % static_cast<unsigned long long>(div)) == 0) {
-                    if (draw_interpolated(bb))
+                    if (draw_interpolated(bb, 0.5f, !flow_ready))
                         g_gen_frames.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -1070,6 +1174,9 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     if (fg::g_settings.aa)
         ImGui::SliderFloat("AA strength", &fg::g_settings.aa_strength, 0.0f, 1.0f);
     ImGui::Checkbox("Edge-aware flow upsampling", &fg::g_settings.flow_edge_aware);
+    ImGui::Checkbox("Temporal reconstruction (experimental)", &fg::g_settings.accumulate);
+    if (fg::g_settings.accumulate)
+        ImGui::SliderFloat("Reconstruction feedback", &fg::g_settings.accum_feedback, 0.0f, 0.95f);
     ImGui::Checkbox("Flow debug view (false-color motion field)", &fg::g_settings.debug_flow_view);
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
     ImGui::Checkbox("Fast mode", &fg::g_settings.fast_mode);
