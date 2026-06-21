@@ -41,6 +41,7 @@ namespace fg
         bool visible_test = false;
         bool pace = true;          // even out present spacing (adds up to ~1 generated-frame of latency)
         bool use_depth = false;    // depth-assisted disocclusion (only active once a depth buffer is found)
+        int present_sync = 0;      // injected-present sync interval: 0 = immediate, 1 = wait for vblank
         int multiplier = 2;        // total output frames per real frame: 2 = 1 generated, 3 = 2, 4 = 3
         int present_interval = 1;
         int preview_divisor = 1;
@@ -66,6 +67,12 @@ namespace fg
     double g_last_wait_total = 0.0; // seconds spent pacing in the previous callback
     double g_slot = 0.0;            // free-running schedule clock: target time of next present
     double g_paced_ms = 0.0;        // last callback's total pacing wait, for the overlay
+
+    // Present-interval history for the on-screen pacing graph. Records the wall-clock gap
+    // between every present we emit (injected + real), so uneven frame durations are visible.
+    float g_present_intervals[128] = {};
+    int g_present_idx = 0;
+    double g_last_present_ts = 0.0;
 
     ID3D11Device *g_dev = nullptr;
     ID3D11DeviceContext *g_ctx = nullptr;
@@ -265,6 +272,18 @@ namespace fg
         LARGE_INTEGER c;
         QueryPerformanceCounter(&c);
         return static_cast<double>(c.QuadPart) / static_cast<double>(g_qpc_freq.QuadPart);
+    }
+
+    // Log the gap since the previous present into the ring buffer for the pacing graph.
+    void record_present()
+    {
+        double t = now_seconds();
+        if (g_last_present_ts > 0.0) {
+            float ms = static_cast<float>((t - g_last_present_ts) * 1000.0);
+            g_present_intervals[g_present_idx] = ms;
+            g_present_idx = (g_present_idx + 1) % 128;
+        }
+        g_last_present_ts = t;
     }
 
     // Busy/sleep hybrid: sleep coarsely while far from the target, then spin for the last
@@ -713,12 +732,13 @@ namespace fg
             return false;
 
         g_inside_extra_present = true;
-        HRESULT phr = swap->Present(0, 0);
+        HRESULT phr = swap->Present(static_cast<UINT>(std::max(0, g_settings.present_sync)), 0);
         g_inside_extra_present = false;
         if (FAILED(phr)) {
             log_debug("extra Present failed hr=0x%08lX", phr);
             return false;
         }
+        record_present();
 
         ID3D11Texture2D *restore_bb = nullptr;
         IDXGISwapChain3 *swap3 = nullptr;
@@ -778,7 +798,10 @@ namespace fg
             if (g_settings.extra_present) {
                 int mult = std::clamp(g_settings.multiplier, 2, 4);
                 int gens = mult - 1;
-                bool do_pace = g_settings.pace && g_dt_ema > 0.0;
+                // When the injected present waits for vblank, the display hardware paces the
+                // frames; software pacing would only fight it, so it stands down.
+                bool hw_pace = g_settings.present_sync >= 1;
+                bool do_pace = g_settings.pace && !hw_pace && g_dt_ema > 0.0;
                 double spacing = do_pace ? (g_dt_ema / static_cast<double>(mult)) : 0.0;
 
                 // Resync the free-running schedule after a hitch / alt-tab / pause.
@@ -816,6 +839,8 @@ namespace fg
 
         g_last_wait_total = wait_total;
         g_paced_ms = wait_total * 1000.0;
+        if (g_settings.extra_present && g_have_prev)
+            record_present();   // the real frame presents right after we return
         std::swap(g_prev_tex, g_curr_tex);
         std::swap(g_prev_srv, g_curr_srv);
         g_have_prev = true;
@@ -829,6 +854,11 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Checkbox("Experimental extra Present", &fg::g_settings.extra_present);
     ImGui::SliderInt("Frame multiplier (x)", &fg::g_settings.multiplier, 2, 4);
     ImGui::Checkbox("Pace frames (adds ~1 frame latency)", &fg::g_settings.pace);
+    {
+        bool vsync = fg::g_settings.present_sync >= 1;
+        if (ImGui::Checkbox("Injected present waits for vblank (vsync)", &vsync))
+            fg::g_settings.present_sync = vsync ? 1 : 0;
+    }
     ImGui::Checkbox("Depth-assisted de-ghosting", &fg::g_settings.use_depth);
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
     ImGui::Checkbox("Fast mode", &fg::g_settings.fast_mode);
@@ -848,6 +878,19 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Text("Draw attempts/success: %llu / %llu", fg::g_draw_attempts.load(), fg::g_draw_success.load());
     ImGui::Text("Flow grid: %ux%u", fg::g_lw, fg::g_lh);
     ImGui::Text("Native frame: %.2f ms | paced wait: %.2f ms", fg::g_dt_ema * 1000.0, fg::g_paced_ms);
+    {
+        // Even spacing = a flat line. A sawtooth (alternating tall/short bars) is the
+        // "144 feels like 60" problem: injected and real frames getting unequal screen time.
+        float mn = 1e9f, mx = 0.0f, sum = 0.0f; int n = 0;
+        for (int i = 0; i < 128; i++) {
+            float v = fg::g_present_intervals[i];
+            if (v > 0.0f) { mn = std::min(mn, v); mx = std::max(mx, v); sum += v; n++; }
+        }
+        if (n > 0) {
+            ImGui::PlotLines("##pace", fg::g_present_intervals, 128, fg::g_present_idx, "present interval (ms)", 0.0f, mx * 1.2f, ImVec2(0, 50));
+            ImGui::Text("present ms  min %.1f / avg %.1f / max %.1f  (spread %.1f)", mn, sum / n, mx, mx - mn);
+        }
+    }
     if (fg::g_settings.use_depth) {
         if (fg::g_depth_cand)
             ImGui::Text("Depth: %ux%u %s", fg::g_depth_w, fg::g_depth_h, fg::g_depth_readable ? "(readable)" : "(found, copying)");
