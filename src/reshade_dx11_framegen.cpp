@@ -73,6 +73,7 @@ namespace fg
     float g_present_intervals[128] = {};
     int g_present_idx = 0;
     double g_last_present_ts = 0.0;
+    double g_ms_draw = 0.0, g_ms_present = 0.0, g_ms_restore = 0.0; // smoothed CPU cost per gen phase
 
     ID3D11Device *g_dev = nullptr;
     ID3D11DeviceContext *g_ctx = nullptr;
@@ -728,8 +729,10 @@ namespace fg
         // Draw the generated frame into the current backbuffer and present it immediately.
         // Then restore the real current frame into the next backbuffer so ReShade/the game can
         // continue with the normal Present.
+        double _t0 = now_seconds();
         if (!draw_interpolated(backbuffer, phase, compute_flow))
             return false;
+        double _t1 = now_seconds();
 
         g_inside_extra_present = true;
         HRESULT phr = swap->Present(static_cast<UINT>(std::max(0, g_settings.present_sync)), 0);
@@ -739,6 +742,7 @@ namespace fg
             return false;
         }
         record_present();
+        double _t2 = now_seconds();
 
         ID3D11Texture2D *restore_bb = nullptr;
         IDXGISwapChain3 *swap3 = nullptr;
@@ -755,6 +759,15 @@ namespace fg
             g_ctx->CopyResource(restore_bb, g_curr_tex);
             restore_bb->Release();
         }
+        double _t3 = now_seconds();
+
+        // Smoothed per-phase CPU cost (the time the real frame is held up by). Note: 'present'
+        // includes the vblank wait when the injected present is vsynced.
+        auto ema = [](double &s, double v) { s = (s > 0.0) ? (s * 0.9 + v * 0.1) : v; };
+        ema(g_ms_draw, (_t1 - _t0) * 1000.0);
+        ema(g_ms_present, (_t2 - _t1) * 1000.0);
+        ema(g_ms_restore, (_t3 - _t2) * 1000.0);
+
         g_extra_presents.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -878,6 +891,7 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Text("Draw attempts/success: %llu / %llu", fg::g_draw_attempts.load(), fg::g_draw_success.load());
     ImGui::Text("Flow grid: %ux%u", fg::g_lw, fg::g_lh);
     ImGui::Text("Native frame: %.2f ms | paced wait: %.2f ms", fg::g_dt_ema * 1000.0, fg::g_paced_ms);
+    ImGui::Text("Gen CPU ms  draw %.2f / present %.2f / restore %.2f", fg::g_ms_draw, fg::g_ms_present, fg::g_ms_restore);
     {
         // Even spacing = a flat line. A sawtooth (alternating tall/short bars) is the
         // "144 feels like 60" problem: injected and real frames getting unequal screen time.
