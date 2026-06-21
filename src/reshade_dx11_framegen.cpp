@@ -92,7 +92,8 @@ namespace fg
         int patchP, ds;
         int usePyramid, smoothFlow;
         int hudProtect, fastMode;
-        float strength, pad1, pad2, pad3;
+        float strength;
+        float pad[5]; // pad FlowCB to 80 bytes (multiple of 16) so CreateBuffer succeeds
     };
 
     const char *kShader = R"HLSL(
@@ -102,7 +103,7 @@ namespace fg
             int searchR,searchS;
             int patchP,ds;
             int usePyramid,smoothFlow;
-            int hudProtect,pad0;
+            int hudProtect,fastMode;
             float strength,pad1,pad2,pad3;
         };
         Texture2D texPrev : register(t0);
@@ -251,34 +252,38 @@ namespace fg
         g_dev->GetImmediateContext(&g_ctx);
 
         ID3DBlob *vs = nullptr, *pf = nullptr, *psm = nullptr, *pi = nullptr;
-        if (!compile_one("VSMain", "vs_5_0", &vs) ||
-            !compile_one("PSFlow", "ps_5_0", &pf) ||
-            !compile_one("PSFlowSmooth", "ps_5_0", &psm) ||
-            !compile_one("PSMain", "ps_5_0", &pi)) {
-            safe_release(vs); safe_release(pf); safe_release(psm); safe_release(pi);
-            return false;
-        }
+        if (!compile_one("VSMain", "vs_5_0", &vs)) { g_status = "VS compile failed"; safe_release(vs); return false; }
+        if (!compile_one("PSFlow", "ps_5_0", &pf)) { g_status = "flow shader compile failed"; safe_release(vs); safe_release(pf); return false; }
+        if (!compile_one("PSFlowSmooth", "ps_5_0", &psm)) { g_status = "smooth shader compile failed"; safe_release(vs); safe_release(pf); safe_release(psm); return false; }
+        if (!compile_one("PSMain", "ps_5_0", &pi)) { g_status = "interp shader compile failed"; safe_release(vs); safe_release(pf); safe_release(psm); safe_release(pi); return false; }
 
-        g_dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g_vs);
-        g_dev->CreatePixelShader(pf->GetBufferPointer(), pf->GetBufferSize(), nullptr, &g_ps_flow);
-        g_dev->CreatePixelShader(psm->GetBufferPointer(), psm->GetBufferSize(), nullptr, &g_ps_smooth);
-        g_dev->CreatePixelShader(pi->GetBufferPointer(), pi->GetBufferSize(), nullptr, &g_ps_interp);
+        g_last_hr = g_dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g_vs);
+        if (FAILED(g_last_hr)) { g_status = "VS create failed"; safe_release(vs); safe_release(pf); safe_release(psm); safe_release(pi); return false; }
+        g_last_hr = g_dev->CreatePixelShader(pf->GetBufferPointer(), pf->GetBufferSize(), nullptr, &g_ps_flow);
+        if (FAILED(g_last_hr)) { g_status = "flow PS create failed"; safe_release(vs); safe_release(pf); safe_release(psm); safe_release(pi); return false; }
+        g_last_hr = g_dev->CreatePixelShader(psm->GetBufferPointer(), psm->GetBufferSize(), nullptr, &g_ps_smooth);
+        if (FAILED(g_last_hr)) { g_status = "smooth PS create failed"; safe_release(vs); safe_release(pf); safe_release(psm); safe_release(pi); return false; }
+        g_last_hr = g_dev->CreatePixelShader(pi->GetBufferPointer(), pi->GetBufferSize(), nullptr, &g_ps_interp);
+        if (FAILED(g_last_hr)) { g_status = "interp PS create failed"; safe_release(vs); safe_release(pf); safe_release(psm); safe_release(pi); return false; }
         safe_release(vs); safe_release(pf); safe_release(psm); safe_release(pi);
 
         D3D11_SAMPLER_DESC sd{};
         sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        g_dev->CreateSamplerState(&sd, &g_smp);
+        g_last_hr = g_dev->CreateSamplerState(&sd, &g_smp);
+        if (FAILED(g_last_hr)) { g_status = "sampler create failed"; return false; }
 
         D3D11_BLEND_DESC bd{};
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-        g_dev->CreateBlendState(&bd, &g_blend);
+        g_last_hr = g_dev->CreateBlendState(&bd, &g_blend);
+        if (FAILED(g_last_hr)) { g_status = "blend create failed"; return false; }
 
         D3D11_BUFFER_DESC cbd{};
         cbd.ByteWidth = sizeof(FlowCB);
         cbd.Usage = D3D11_USAGE_DEFAULT;
         cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        g_dev->CreateBuffer(&cbd, nullptr, &g_cb);
+        g_last_hr = g_dev->CreateBuffer(&cbd, nullptr, &g_cb);
+        if (FAILED(g_last_hr)) { g_status = "cbuffer create failed"; return false; }
 
         g_pipeline_ready = g_vs && g_ps_flow && g_ps_smooth && g_ps_interp && g_smp && g_blend && g_cb;
         if (g_pipeline_ready)
@@ -513,7 +518,8 @@ namespace fg
         if (api_device == nullptr || api_device->get_api() != reshade::api::device_api::d3d11) { g_status = "not d3d11"; return; }
 
         ID3D11Device *dev = reinterpret_cast<ID3D11Device *>(api_device->get_native());
-        if (!dev || !ensure_device(dev)) { g_status = "pipeline failed"; return; }
+        if (!dev) { g_status = "no d3d11 device"; return; }
+        if (!ensure_device(dev)) { if (!g_status || std::strcmp(g_status, "idle") == 0) g_status = "pipeline failed"; return; }
 
         reshade::api::resource backbuffer_resource = runtime->get_current_back_buffer();
         ID3D11Texture2D *bb = reinterpret_cast<ID3D11Texture2D *>(backbuffer_resource.handle);

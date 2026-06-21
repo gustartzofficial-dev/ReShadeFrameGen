@@ -46,3 +46,8 @@ Start with:
 - Preview every N frames: 2
 
 Only enable Experimental extra Present after preview draw attempts and success increase.
+
+
+## 2026-06-21 pipeline fix
+
+Fixed the active preview pipeline failing because the HLSL constant buffer did not expose `fastMode` even though the shader used it. The add-on now also reports more specific pipeline creation errors in the overlay status.
