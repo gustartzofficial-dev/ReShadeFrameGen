@@ -8,6 +8,8 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <dxgi1_4.h>
+#include <d3d12.h>
+#include <d3d11on12.h>
 #include <d3dcompiler.h>
 #include <atomic>
 #include <algorithm>
@@ -49,6 +51,7 @@ namespace fg
         bool flow_edge_aware = true;  // joint-bilateral flow upsampling (de-blockifies motion edges)
         bool accumulate = false;      // temporal reconstruction (back-projection); experimental, feedback loop
         float accum_feedback = 0.85f; // max history weight per frame (0..0.95)
+        bool dx12_bridge = false;     // experimental: run the pipeline on DX12 games via D3D11On12
         int multiplier = 2;        // total output frames per real frame: 2 = 1 generated, 3 = 2, 4 = 3
         int present_interval = 1;
         int preview_divisor = 1;
@@ -90,6 +93,16 @@ namespace fg
     ID3D11PixelShader *g_ps_interp = nullptr;
     ID3D11PixelShader *g_ps_aa = nullptr;
     ID3D11PixelShader *g_ps_debug = nullptr;
+
+    // D3D12 bridge state (used only on DX12 games via the D3D11On12 path; see the bridge block).
+    bool g_frame_is_d3d12 = false;
+    ID3D11On12Device *g_11on12 = nullptr;
+    ID3D12Device *g_d12dev = nullptr;          // borrowed from the runtime, not owned
+    struct WrappedBuf { ID3D12Resource *d12 = nullptr; ID3D11Resource *res11 = nullptr; ID3D11Texture2D *tex = nullptr; };
+    WrappedBuf g_wrapped[8];
+    ID3D11Resource *g_acquired = nullptr;      // wrapped resource acquired this frame (released at frame end)
+    void clear_wrapped_d3d12();                // defined in the bridge block near run()
+    void release_d3d12_bridge();
     ID3D11PixelShader *g_ps_accum = nullptr;
     ID3D11SamplerState *g_smp = nullptr;
     ID3D11BlendState *g_blend = nullptr;
@@ -599,6 +612,7 @@ namespace fg
     void release_resources()
     {
         clear_bbrtv_cache();
+        clear_wrapped_d3d12();   // wrapped swapchain buffers are stale after a resize
         safe_release(g_prev_srv); safe_release(g_prev_tex);
         safe_release(g_curr_srv); safe_release(g_curr_tex);
         safe_release(g_aa_src_srv); safe_release(g_aa_src);
@@ -615,6 +629,7 @@ namespace fg
         release_resources();
         safe_release(g_cb); safe_release(g_blend); safe_release(g_smp);
         safe_release(g_ps_interp); safe_release(g_ps_smooth); safe_release(g_ps_flow); safe_release(g_ps_aa); safe_release(g_ps_debug); safe_release(g_ps_accum); safe_release(g_vs);
+        release_d3d12_bridge();
         safe_release(g_ctx); safe_release(g_dev);
         g_pipeline_ready = false;
     }
@@ -1070,6 +1085,109 @@ namespace fg
         restore(s);
     }
 
+    // ---- D3D12 bridge (D3D11On12) --------------------------------------------------------
+    // DX12 games hand ReShade an ID3D12Device, but this whole pipeline is D3D11. Instead of
+    // porting every pass to native D3D12, we stand up a D3D11 device that rides on the game's
+    // D3D12 device via D3D11On12 and run the existing code through it. Each frame we wrap the
+    // current D3D12 swapchain backbuffer as a D3D11 texture, acquire it for D3D11 use, draw, then
+    // release + flush so the game's own Present shows the result. Experimental and opt-in; the
+    // extra-Present frame multiplier is intentionally left to the DX11 path for now (injecting a
+    // present into a D3D12 swapchain needs fence/backbuffer-index handling we haven't built yet).
+    void clear_wrapped_d3d12()
+    {
+        for (auto &w : g_wrapped) { safe_release(w.tex); safe_release(w.res11); w.d12 = nullptr; }
+        g_acquired = nullptr;
+    }
+
+    void release_d3d12_bridge()
+    {
+        clear_wrapped_d3d12();
+        safe_release(g_11on12);
+        g_d12dev = nullptr;
+    }
+
+    bool ensure_d3d12_bridge(reshade::api::effect_runtime *runtime, ID3D12Device *d12dev)
+    {
+        if (g_11on12 && g_d12dev == d12dev && g_pipeline_ready)
+            return true;
+
+        reshade::api::command_queue *q = runtime->get_command_queue();
+        ID3D12CommandQueue *cq = q ? reinterpret_cast<ID3D12CommandQueue *>(q->get_native()) : nullptr;
+        if (!cq) { g_status = "dx12: no command queue from runtime"; return false; }
+
+        IUnknown *queues[1] = { cq };
+        ID3D11Device *d11 = nullptr;
+        ID3D11DeviceContext *ctx11 = nullptr;
+
+        // Resolve D3D11On12CreateDevice at runtime so the addon doesn't need d3d11.lib linked.
+        typedef HRESULT(WINAPI * PFN_D3D11ON12)(IUnknown *, UINT, const D3D_FEATURE_LEVEL *, UINT,
+                                                IUnknown *const *, UINT, UINT,
+                                                ID3D11Device **, ID3D11DeviceContext **, D3D_FEATURE_LEVEL *);
+        static PFN_D3D11ON12 fn = nullptr;
+        if (!fn) {
+            HMODULE h = GetModuleHandleW(L"d3d11.dll");
+            if (!h) h = LoadLibraryW(L"d3d11.dll");
+            if (h) fn = reinterpret_cast<PFN_D3D11ON12>(GetProcAddress(h, "D3D11On12CreateDevice"));
+        }
+        if (!fn) { g_status = "dx12: D3D11On12CreateDevice unavailable"; return false; }
+
+        HRESULT hr = fn(d12dev, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                        queues, 1, 0, &d11, &ctx11, nullptr);
+        if (FAILED(hr) || !d11) { g_last_hr = hr; g_status = "dx12: D3D11On12CreateDevice failed"; safe_release(d11); safe_release(ctx11); return false; }
+
+        // Build the entire D3D11 pipeline on the 11On12 device (ensure_device runs shutdown()
+        // first, which releases any stale bridge before we publish the new one below).
+        bool ok = ensure_device(d11);
+        if (ok)
+            hr = d11->QueryInterface(__uuidof(ID3D11On12Device), reinterpret_cast<void **>(&g_11on12));
+        safe_release(d11);     // ensure_device took its own ref
+        safe_release(ctx11);   // ensure_device fetched its own immediate context
+        if (!ok) { g_status = "dx12: pipeline build failed on 11On12 device"; return false; }
+        if (FAILED(hr) || !g_11on12) { g_last_hr = hr; g_status = "dx12: no ID3D11On12Device interface"; return false; }
+
+        g_d12dev = d12dev;
+        return true;
+    }
+
+    // Wrap (cached) and acquire the given D3D12 backbuffer for D3D11 rendering. Returns the
+    // D3D11 view of it; call release_backbuffer_d3d12() once the frame's draws are submitted.
+    ID3D11Texture2D *acquire_backbuffer_d3d12(ID3D12Resource *d12res)
+    {
+        WrappedBuf *w = nullptr;
+        for (auto &e : g_wrapped) if (e.d12 == d12res) { w = &e; break; }
+        if (!w) {
+            D3D11_RESOURCE_FLAGS f = {};
+            f.BindFlags = D3D11_BIND_RENDER_TARGET;   // matches how a swapchain buffer is created
+            ID3D11Resource *res11 = nullptr;
+            HRESULT hr = g_11on12->CreateWrappedResource(
+                d12res, &f,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,   // state while D3D11 owns it (acquired)
+                D3D12_RESOURCE_STATE_PRESENT,         // state handed back on release
+                __uuidof(ID3D11Resource), reinterpret_cast<void **>(&res11));
+            if (FAILED(hr) || !res11) { g_last_hr = hr; g_status = "dx12: wrap backbuffer failed"; return nullptr; }
+            ID3D11Texture2D *tex = nullptr;
+            res11->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex));
+            if (!tex) { safe_release(res11); g_status = "dx12: wrapped resource not a texture2d"; return nullptr; }
+            for (auto &e : g_wrapped) if (!e.d12) { e.d12 = d12res; e.res11 = res11; e.tex = tex; w = &e; break; }
+            if (!w) { safe_release(tex); safe_release(res11); g_status = "dx12: wrapped-buffer cache full"; return nullptr; }
+        }
+        ID3D11Resource *acq[1] = { w->res11 };
+        g_11on12->AcquireWrappedResources(acq, 1);
+        g_acquired = w->res11;
+        return w->tex;
+    }
+
+    void release_backbuffer_d3d12()
+    {
+        if (!g_11on12 || !g_acquired)
+            return;
+        ID3D11Resource *rel[1] = { g_acquired };
+        g_11on12->ReleaseWrappedResources(rel, 1);
+        g_acquired = nullptr;
+        if (g_ctx)
+            g_ctx->Flush();   // push our D3D11 work onto the shared D3D12 queue before the game presents
+    }
+
     void run(reshade::api::effect_runtime *runtime)
     {
         if (g_inside_extra_present)
@@ -1082,15 +1200,36 @@ namespace fg
         }
 
         reshade::api::device *api_device = runtime->get_device();
-        if (api_device == nullptr || api_device->get_api() != reshade::api::device_api::d3d11) { g_status = "idle: DX11-only addon (unsupported device, e.g. DX12/Vulkan)"; return; }
+        if (api_device == nullptr) { g_status = "no device"; return; }
+        const reshade::api::device_api api = api_device->get_api();
 
-        ID3D11Device *dev = reinterpret_cast<ID3D11Device *>(api_device->get_native());
-        if (!dev) { g_status = "no d3d11 device"; return; }
-        if (!ensure_device(dev)) { if (!g_status || std::strcmp(g_status, "idle") == 0) g_status = "pipeline failed"; return; }
+        ID3D11Texture2D *bb = nullptr;
+        g_frame_is_d3d12 = false;
 
-        reshade::api::resource backbuffer_resource = runtime->get_current_back_buffer();
-        ID3D11Texture2D *bb = reinterpret_cast<ID3D11Texture2D *>(backbuffer_resource.handle);
-        if (!bb || !ensure_resources(bb)) { if (!bb) g_status = "no backbuffer"; return; }
+        if (api == reshade::api::device_api::d3d11) {
+            ID3D11Device *dev = reinterpret_cast<ID3D11Device *>(api_device->get_native());
+            if (!dev) { g_status = "no d3d11 device"; return; }
+            if (!ensure_device(dev)) { if (!g_status || std::strcmp(g_status, "idle") == 0) g_status = "pipeline failed"; return; }
+            reshade::api::resource br = runtime->get_current_back_buffer();
+            bb = reinterpret_cast<ID3D11Texture2D *>(br.handle);
+        }
+        else if (api == reshade::api::device_api::d3d12) {
+            if (!g_settings.dx12_bridge) { g_status = "idle: DX12 detected (enable 'DX12 bridge' to use)"; return; }
+            ID3D12Device *d12 = reinterpret_cast<ID3D12Device *>(api_device->get_native());
+            if (!d12) { g_status = "no d3d12 device"; return; }
+            if (!ensure_d3d12_bridge(runtime, d12)) return;   // status set inside on failure
+            reshade::api::resource br = runtime->get_current_back_buffer();
+            ID3D12Resource *d12res = reinterpret_cast<ID3D12Resource *>(br.handle);
+            bb = d12res ? acquire_backbuffer_d3d12(d12res) : nullptr;   // wrap + acquire for D3D11 use
+            g_frame_is_d3d12 = true;
+        }
+        else { g_status = "idle: unsupported device (Vulkan/OpenGL)"; return; }
+
+        if (!bb || !ensure_resources(bb)) {
+            if (!bb) g_status = "no backbuffer";
+            if (g_frame_is_d3d12) release_backbuffer_d3d12();   // don't leave it acquired on bail-out
+            return;
+        }
 
         if (g_settings.aa)
             apply_aa(bb);            // AA the real frame first so generated frames inherit it
@@ -1124,7 +1263,7 @@ namespace fg
                 static const char *names[] = { "off", "debug: flow", "debug: depth", "debug: confidence" };
                 int m = std::clamp(g_settings.debug_mode, 0, 3);
                 g_status = names[m];
-            } else if (g_settings.extra_present) {
+            } else if (g_settings.extra_present && !g_frame_is_d3d12) {
                 int mult = std::clamp(g_settings.multiplier, 2, 4);
                 int gens = mult - 1;
                 // Software pacing is the only thing that spreads the back-to-back generated/real
@@ -1156,12 +1295,17 @@ namespace fg
                     wait_total += now_seconds() - b;
                     g_slot += spacing;
                 }
-            } else {
+            } else if (!g_frame_is_d3d12) {
                 int div = std::max(1, g_settings.preview_divisor);
                 if ((frame_index % static_cast<unsigned long long>(div)) == 0) {
                     if (draw_interpolated(bb, 0.5f, !flow_ready))
                         g_gen_frames.fetch_add(1, std::memory_order_relaxed);
                 }
+            } else {
+                // DX12 in-place path: the accumulator (if on) already reconstructed the frame in
+                // the backbuffer; nothing further to draw. Frame multiplication awaits the
+                // D3D12 present-injection work.
+                g_status = g_settings.accumulate ? "dx12: reconstruction (in-place)" : "dx12: bridge active (pass-through)";
             }
         }
         else { g_status = "history warming up"; }
@@ -1173,6 +1317,9 @@ namespace fg
         std::swap(g_prev_tex, g_curr_tex);
         std::swap(g_prev_srv, g_curr_srv);
         g_have_prev = true;
+
+        if (g_frame_is_d3d12)
+            release_backbuffer_d3d12();   // hand the backbuffer back to D3D12 and flush our work
     }
 }
 
@@ -1204,6 +1351,10 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Checkbox("Temporal reconstruction (experimental)", &fg::g_settings.accumulate);
     if (fg::g_settings.accumulate)
         ImGui::SliderFloat("Reconstruction feedback", &fg::g_settings.accum_feedback, 0.0f, 0.95f);
+    if (ImGui::Checkbox("DX12 bridge (experimental, D3D11On12)", &fg::g_settings.dx12_bridge))
+        fg::shutdown();   // tear down so the next frame rebuilds on the correct device path
+    if (fg::g_settings.dx12_bridge)
+        ImGui::TextDisabled("  DX12 games only; runs reconstruction + debug in-place. No frame\n  multiplication yet (extra-Present is DX11-only for now).");
     {
         const char *debug_items[] = { "Off", "Flow (false-color motion)", "Depth (raw buffer)", "Confidence (flow trust)" };
         ImGui::Combo("Debug view", &fg::g_settings.debug_mode, debug_items, 4);
