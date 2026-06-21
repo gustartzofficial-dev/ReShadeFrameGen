@@ -42,6 +42,7 @@ namespace fg
         bool pace = true;          // even out present spacing (adds up to ~1 generated-frame of latency)
         bool use_depth = false;    // depth-assisted disocclusion (only active once a depth buffer is found)
         int present_sync = 0;      // injected-present sync interval: 0 = immediate, 1 = wait for vblank
+        bool effects_once = true;  // skip ReShade's effect chain on injected frames (they inherit it from the real frames)
         int multiplier = 2;        // total output frames per real frame: 2 = 1 generated, 3 = 2, 4 = 3
         int present_interval = 1;
         int preview_divisor = 1;
@@ -734,9 +735,26 @@ namespace fg
             return false;
         double _t1 = now_seconds();
 
+        // The generated frame is interpolated from real frames that already have ReShade's
+        // effects baked in, so re-running the effect chain on it (which our Present would
+        // trigger) is pure wasted cost — at 2x it makes a heavy effect like RT run twice per
+        // real frame. Disable effects across just the injected present, then restore the
+        // user's state for the real frame.
+        bool fx_prev = false, fx_toggled = false;
+        if (g_settings.effects_once) {
+            fx_prev = runtime->get_effects_state();
+            if (fx_prev) { runtime->set_effects_state(false); fx_toggled = true; }
+        }
+
         g_inside_extra_present = true;
-        HRESULT phr = swap->Present(static_cast<UINT>(std::max(0, g_settings.present_sync)), 0);
+        // While software pacing, present immediately; pacing controls the timing. The vblank
+        // sync interval only applies when pacing is off.
+        UINT sync = g_settings.pace ? 0u : static_cast<UINT>(std::max(0, g_settings.present_sync));
+        HRESULT phr = swap->Present(sync, 0);
         g_inside_extra_present = false;
+
+        if (fx_toggled)
+            runtime->set_effects_state(true);
         if (FAILED(phr)) {
             log_debug("extra Present failed hr=0x%08lX", phr);
             return false;
@@ -811,10 +829,10 @@ namespace fg
             if (g_settings.extra_present) {
                 int mult = std::clamp(g_settings.multiplier, 2, 4);
                 int gens = mult - 1;
-                // When the injected present waits for vblank, the display hardware paces the
-                // frames; software pacing would only fight it, so it stands down.
-                bool hw_pace = g_settings.present_sync >= 1;
-                bool do_pace = g_settings.pace && !hw_pace && g_dt_ema > 0.0;
+                // Software pacing is the only thing that spreads the back-to-back generated/real
+                // present pair in this design, so it runs whenever enabled. (The vblank toggle
+                // only takes effect when pacing is off; a vblank wait would fight the schedule.)
+                bool do_pace = g_settings.pace && g_dt_ema > 0.0;
                 double spacing = do_pace ? (g_dt_ema / static_cast<double>(mult)) : 0.0;
 
                 // Resync the free-running schedule after a hitch / alt-tab / pause.
@@ -869,10 +887,11 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Checkbox("Pace frames (adds ~1 frame latency)", &fg::g_settings.pace);
     {
         bool vsync = fg::g_settings.present_sync >= 1;
-        if (ImGui::Checkbox("Injected present waits for vblank (vsync)", &vsync))
+        if (ImGui::Checkbox("Injected present waits for vblank (only when pacing off)", &vsync))
             fg::g_settings.present_sync = vsync ? 1 : 0;
     }
     ImGui::Checkbox("Depth-assisted de-ghosting", &fg::g_settings.use_depth);
+    ImGui::Checkbox("Skip ReShade effects on generated frames", &fg::g_settings.effects_once);
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
     ImGui::Checkbox("Fast mode", &fg::g_settings.fast_mode);
     ImGui::Checkbox("Fast search", &fg::g_settings.fast_search);
