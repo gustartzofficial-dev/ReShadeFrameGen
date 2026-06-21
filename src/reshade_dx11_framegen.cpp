@@ -46,6 +46,7 @@ namespace fg
         bool aa = false;           // depth-aware spatial edge AA (experimental; adds a full-screen pass)
         float aa_strength = 0.6f;  // AA blend amount (0..1)
         bool debug_flow_view = false; // show the optical-flow field as false color (diagnostic)
+        bool flow_edge_aware = true;  // joint-bilateral flow upsampling (de-blockifies motion edges)
         int multiplier = 2;        // total output frames per real frame: 2 = 1 generated, 3 = 2, 4 = 3
         int present_interval = 1;
         int preview_divisor = 1;
@@ -138,7 +139,8 @@ namespace fg
         float strength, phase;
         int useDepth;
         float aaBlend;
-        float pad[2]; // FlowCB is 80 bytes (multiple of 16) so CreateBuffer succeeds
+        int useEdgeFlow;
+        float pad; // FlowCB is 80 bytes (multiple of 16) so CreateBuffer succeeds
     };
 
     const char *kShader = R"HLSL(
@@ -152,7 +154,8 @@ namespace fg
             float strength,phase;
             int useDepth;
             float aaBlend;
-            float pad2,pad3;
+            int useEdgeFlow;
+            float pad3;
         };
         Texture2D texPrev : register(t0);
         Texture2D texCurr : register(t1);
@@ -222,6 +225,31 @@ namespace fg
             return float4(flowPx, conf, 1);
         }
 
+        // Edge-aware (joint-bilateral) flow fetch: blends the 4 nearest coarse-grid cells weighted
+        // by how well each cell's color matches this pixel, so a motion vector at an object boundary
+        // comes from the correct surface instead of a blur across the edge. Falls back to bilinear.
+        float4 fetchFlow(float2 uv) {
+            if (useEdgeFlow == 0)
+                return flowTex.SampleLevel(smp, uv, 0);
+            float2 g = float2(lowW, lowH);
+            float2 fp = uv * g - 0.5;
+            float2 fl = floor(fp);
+            float2 fr = fp - fl;
+            float lc = luma(texCurr.SampleLevel(smp, uv, 0).rgb);
+            float4 acc = 0; float wsum = 0;
+            [unroll] for (int dy = 0; dy <= 1; dy++)
+            [unroll] for (int dx = 0; dx <= 1; dx++) {
+                float2 cell = (fl + float2(dx, dy) + 0.5) / g;
+                float4 fv = flowTex.SampleLevel(smp, cell, 0);
+                float bw = (dx ? fr.x : 1.0 - fr.x) * (dy ? fr.y : 1.0 - fr.y);
+                float ll = luma(texCurr.SampleLevel(smp, cell, 0).rgb);
+                float cw = exp(-abs(lc - ll) * 8.0);
+                float w = bw * cw + 1e-4;
+                acc += fv * w; wsum += w;
+            }
+            return acc / wsum;
+        }
+
         // False-color visualization of the flow field for debugging: hue = motion direction,
         // brightness = speed, saturation = confidence. Gray/dim = still or untrusted.
         float3 hsv2rgb(float3 c) {
@@ -230,7 +258,7 @@ namespace fg
             return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
         }
         float4 PSFlowViz(VSOut i) : SV_Target {
-            float4 f = flowTex.SampleLevel(smp, i.uv, 0);
+            float4 f = fetchFlow(i.uv);
             float mag = length(f.xy);
             float hue = (atan2(f.y, f.x) / 6.2831853) + 0.5;
             float val = max(saturate(mag / 16.0), 0.06);
@@ -247,7 +275,7 @@ namespace fg
         }
         float4 PSMain(VSOut i) : SV_Target {
             float t = saturate(phase);                 // temporal position: 0 = prev, 1 = curr
-            float4 f = flowTex.SampleLevel(smp, i.uv, 0);
+            float4 f = fetchFlow(i.uv);
             float2 ouv = f.xy * float2(invW, invH);
             float conf = saturate(f.z) * saturate(strength);
 
@@ -773,6 +801,7 @@ namespace fg
         cb.fastMode = g_settings.fast_mode ? 1 : 0;
         cb.strength = g_settings.strength;
         cb.phase = phase;
+        cb.useEdgeFlow = g_settings.flow_edge_aware ? 1 : 0;
 
         // Depth-assisted disocclusion: refresh the readable depth copy on the flow-computing
         // phase, reuse it for the other phases (depth is identical across phases of one frame).
@@ -1034,6 +1063,7 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Checkbox("Depth-aware AA (experimental, costs a pass)", &fg::g_settings.aa);
     if (fg::g_settings.aa)
         ImGui::SliderFloat("AA strength", &fg::g_settings.aa_strength, 0.0f, 1.0f);
+    ImGui::Checkbox("Edge-aware flow upsampling", &fg::g_settings.flow_edge_aware);
     ImGui::Checkbox("Flow debug view (false-color motion field)", &fg::g_settings.debug_flow_view);
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
     ImGui::Checkbox("Fast mode", &fg::g_settings.fast_mode);
