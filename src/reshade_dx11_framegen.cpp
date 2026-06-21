@@ -45,7 +45,7 @@ namespace fg
         bool effects_once = true;  // skip ReShade's effect chain on injected frames (they inherit it from the real frames)
         bool aa = false;           // depth-aware spatial edge AA (experimental; adds a full-screen pass)
         float aa_strength = 0.6f;  // AA blend amount (0..1)
-        bool debug_flow_view = false; // show the optical-flow field as false color (diagnostic)
+        int debug_mode = 0;           // 0 off, 1 flow, 2 depth, 3 confidence (diagnostic raw-data views)
         bool flow_edge_aware = true;  // joint-bilateral flow upsampling (de-blockifies motion edges)
         bool accumulate = false;      // temporal reconstruction (back-projection); experimental, feedback loop
         float accum_feedback = 0.85f; // max history weight per frame (0..0.95)
@@ -89,7 +89,7 @@ namespace fg
     ID3D11PixelShader *g_ps_smooth = nullptr;
     ID3D11PixelShader *g_ps_interp = nullptr;
     ID3D11PixelShader *g_ps_aa = nullptr;
-    ID3D11PixelShader *g_ps_flowviz = nullptr;
+    ID3D11PixelShader *g_ps_debug = nullptr;
     ID3D11PixelShader *g_ps_accum = nullptr;
     ID3D11SamplerState *g_smp = nullptr;
     ID3D11BlendState *g_blend = nullptr;
@@ -260,19 +260,34 @@ namespace fg
             float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
             return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
         }
-        float4 PSFlowViz(VSOut i) : SV_Target {
+        // Multi-mode diagnostic view. The mode rides in on 'phase' (set by the host for the
+        // debug pass): 1 = flow false-color, 2 = depth, 3 = confidence heatmap. Every mode
+        // composites over a dimmed game image so the scene stays visible and the ReShade overlay
+        // is never hidden -- you can't get blinded or trapped. texPrev=t0, texCurr=t1, flow=t2,
+        // depth=t3.
+        float4 PSDebug(VSOut i) : SV_Target {
+            int mode = (int)(phase + 0.5);
+            float3 game = texCurr.SampleLevel(smp, i.uv, 0).rgb;
+            if (mode == 2) {
+                // Raw scene depth. Gamma'd so the usually-compressed near range is readable.
+                float d = depthTex.SampleLevel(smp, i.uv, 0).r;
+                float v = pow(saturate(d), 0.35);
+                return float4(lerp(game * 0.25, v.xxx, 0.85), 1.0);
+            }
+            if (mode == 3) {
+                // Flow confidence as a heatmap: red = untrusted, green = trusted.
+                float c = saturate(fetchFlow(i.uv).z);
+                float3 hm = lerp(float3(0.9, 0.1, 0.1), float3(0.1, 0.9, 0.1), c);
+                return float4(lerp(game * 0.4, hm, 0.75), 1.0);
+            }
+            // mode 1 (default): flow direction = hue, speed = brightness, confidence = saturation.
             float4 f = fetchFlow(i.uv);
             float mag = length(f.xy);
             float hue = (atan2(f.y, f.x) / 6.2831853) + 0.5;
             float val = max(saturate(mag / 16.0), 0.06);
             float3 rgb = hsv2rgb(float3(hue, saturate(f.z), val));
-            // Overlay the flow on top of a dimmed game image instead of replacing it, so the
-            // scene stays visible for reference and you can never get blinded if the ReShade
-            // overlay closes. Flow paints in only where there is confident motion.
-            float3 game = texCurr.SampleLevel(smp, i.uv, 0).rgb;
             float vizAmt = min(0.85, saturate(f.z) * saturate(mag * 0.5 + 0.15));
-            float3 outc = lerp(game * 0.6, rgb, vizAmt);
-            return float4(outc, 1.0);
+            return float4(lerp(game * 0.6, rgb, vizAmt), 1.0);
         }
         float4 PSFlowSmooth(VSOut i) : SV_Target {
             float2 ts = float2(1.0 / lowW, 1.0 / lowH);
@@ -599,7 +614,7 @@ namespace fg
         depth_reset();
         release_resources();
         safe_release(g_cb); safe_release(g_blend); safe_release(g_smp);
-        safe_release(g_ps_interp); safe_release(g_ps_smooth); safe_release(g_ps_flow); safe_release(g_ps_aa); safe_release(g_ps_flowviz); safe_release(g_ps_accum); safe_release(g_vs);
+        safe_release(g_ps_interp); safe_release(g_ps_smooth); safe_release(g_ps_flow); safe_release(g_ps_aa); safe_release(g_ps_debug); safe_release(g_ps_accum); safe_release(g_vs);
         safe_release(g_ctx); safe_release(g_dev);
         g_pipeline_ready = false;
     }
@@ -650,8 +665,8 @@ namespace fg
             safe_release(pa);
         }
         ID3DBlob *pv = nullptr;
-        if (compile_one("PSFlowViz", "ps_5_0", &pv) && pv) {
-            g_dev->CreatePixelShader(pv->GetBufferPointer(), pv->GetBufferSize(), nullptr, &g_ps_flowviz);
+        if (compile_one("PSDebug", "ps_5_0", &pv) && pv) {
+            g_dev->CreatePixelShader(pv->GetBufferPointer(), pv->GetBufferSize(), nullptr, &g_ps_debug);
             safe_release(pv);
         }
         ID3DBlob *pac = nullptr;
@@ -855,6 +870,8 @@ namespace fg
         ID3D11ShaderResourceView *dsrv = nullptr;
         if (g_settings.use_depth)
             dsrv = compute_flow ? depth_current_srv() : g_depth_srv;
+        else if (viz && g_settings.debug_mode == 2)
+            dsrv = depth_current_srv();   // depth debug view needs the buffer regardless of de-ghosting
         cb.useDepth = dsrv ? 1 : 0;
 
         g_ctx->UpdateSubresource(g_cb, 0, nullptr, &cb, 0, 0);
@@ -870,9 +887,9 @@ namespace fg
                 pass(g_flow2_rtv, static_cast<float>(g_lw), static_cast<float>(g_lh), g_ps_smooth, nullsrv, nullsrv, g_flow1_srv);
         }
         g_ctx->PSSetShaderResources(3, 1, &dsrv);   // depthTex (t3); null when unavailable
-        if (viz && g_ps_flowviz) {
-            pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_flowviz,
-                 nullsrv, nullsrv, use_smooth ? g_flow2_srv : g_flow1_srv);
+        if (viz && g_ps_debug) {
+            pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_debug,
+                 g_prev_srv, g_curr_srv, use_smooth ? g_flow2_srv : g_flow1_srv);
         } else {
             pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_interp,
                  g_prev_srv, g_curr_srv, use_smooth ? g_flow2_srv : g_flow1_srv);
@@ -1065,7 +1082,7 @@ namespace fg
         }
 
         reshade::api::device *api_device = runtime->get_device();
-        if (api_device == nullptr || api_device->get_api() != reshade::api::device_api::d3d11) { g_status = "not d3d11"; return; }
+        if (api_device == nullptr || api_device->get_api() != reshade::api::device_api::d3d11) { g_status = "idle: DX11-only addon (unsupported device, e.g. DX12/Vulkan)"; return; }
 
         ID3D11Device *dev = reinterpret_cast<ID3D11Device *>(api_device->get_native());
         if (!dev) { g_status = "no d3d11 device"; return; }
@@ -1082,7 +1099,7 @@ namespace fg
         // Temporal reconstruction: rebuild the real frame from history before anything reads it,
         // so both the displayed frame and the interpolated frames inherit it. Leaves flow ready.
         bool flow_ready = false;
-        if (g_settings.accumulate && g_have_prev && !g_settings.debug_flow_view) {
+        if (g_settings.accumulate && g_have_prev && g_settings.debug_mode == 0) {
             apply_accumulator(bb);
             g_ctx->CopyResource(g_curr_tex, bb);   // reconstructed -> feeds FG and next history
             flow_ready = true;
@@ -1100,10 +1117,13 @@ namespace fg
         double wait_total = 0.0;
 
         if (g_have_prev) {
-            if (g_settings.debug_flow_view) {
-                // Diagnostic: paint the flow field onto the real frame and skip generation.
-                draw_interpolated(bb, 0.5f, true, true);
-                g_status = "flow debug view";
+            if (g_settings.debug_mode != 0) {
+                // Diagnostic: paint the selected raw-data view onto the real frame, skip generation.
+                // The mode rides in through the phase argument (PSDebug reads it back).
+                draw_interpolated(bb, static_cast<float>(g_settings.debug_mode), true, true);
+                static const char *names[] = { "off", "debug: flow", "debug: depth", "debug: confidence" };
+                int m = std::clamp(g_settings.debug_mode, 0, 3);
+                g_status = names[m];
             } else if (g_settings.extra_present) {
                 int mult = std::clamp(g_settings.multiplier, 2, 4);
                 int gens = mult - 1;
@@ -1158,6 +1178,13 @@ namespace fg
 
 static void draw_settings_overlay(reshade::api::effect_runtime *)
 {
+    if (ImGui::Button("Reset all to defaults")) {
+        bool was_enabled = fg::g_settings.enabled;
+        fg::g_settings = fg::Settings{};   // revert every option to its standard value
+        fg::g_settings.enabled = was_enabled; // keep the addon on/off as the user left it
+        fg::release_resources();           // flow downscale may have changed -> rebuild buffers
+    }
+    ImGui::Separator();
     ImGui::Checkbox("Enable framegen", &fg::g_settings.enabled);
     ImGui::Checkbox("Active preview render", &fg::g_settings.active_preview);
     ImGui::Checkbox("Experimental extra Present", &fg::g_settings.extra_present);
@@ -1177,7 +1204,11 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Checkbox("Temporal reconstruction (experimental)", &fg::g_settings.accumulate);
     if (fg::g_settings.accumulate)
         ImGui::SliderFloat("Reconstruction feedback", &fg::g_settings.accum_feedback, 0.0f, 0.95f);
-    ImGui::Checkbox("Flow debug view (false-color motion field)", &fg::g_settings.debug_flow_view);
+    {
+        const char *debug_items[] = { "Off", "Flow (false-color motion)", "Depth (raw buffer)", "Confidence (flow trust)" };
+        ImGui::Combo("Debug view", &fg::g_settings.debug_mode, debug_items, 4);
+        ImGui::TextDisabled("  shows the raw data a pass is working from; generation pauses while on");
+    }
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
     ImGui::Checkbox("Fast mode", &fg::g_settings.fast_mode);
     ImGui::Checkbox("Fast search", &fg::g_settings.fast_search);
