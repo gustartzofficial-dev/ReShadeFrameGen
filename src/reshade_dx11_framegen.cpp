@@ -36,6 +36,8 @@ namespace fg
         bool debug_overlay = true;
         bool fast_mode = true;
         bool extra_present = false;
+        bool active_preview = true;
+        bool visible_test = false;
         int present_interval = 1;
         int preview_divisor = 1;
         int flow_downscale = 24;
@@ -47,7 +49,11 @@ namespace fg
     std::atomic<unsigned long long> g_real_frames{0};
     std::atomic<unsigned long long> g_gen_frames{0};
     std::atomic<unsigned long long> g_extra_presents{0};
+    std::atomic<unsigned long long> g_draw_attempts{0};
+    std::atomic<unsigned long long> g_draw_success{0};
     bool g_inside_extra_present = false;
+    const char *g_status = "idle";
+    HRESULT g_last_hr = S_OK;
 
     ID3D11Device *g_dev = nullptr;
     ID3D11DeviceContext *g_ctx = nullptr;
@@ -290,9 +296,10 @@ namespace fg
         d.SampleDesc.Count = 1;
         d.SampleDesc.Quality = 0;
         HRESULT hr = g_dev->CreateTexture2D(&d, nullptr, tex);
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) { g_last_hr = hr; log_debug("CreateTexture2D capture failed hr=0x%08lX fmt=%u %ux%u", hr, d.Format, d.Width, d.Height); return false; }
         hr = g_dev->CreateShaderResourceView(*tex, nullptr, srv);
-        return SUCCEEDED(hr);
+        if (FAILED(hr)) { g_last_hr = hr; log_debug("CreateSRV capture failed hr=0x%08lX fmt=%u", hr, d.Format); return false; }
+        return true;
     }
 
     bool make_flow(ID3D11Texture2D **tex, ID3D11RenderTargetView **rtv, ID3D11ShaderResourceView **srv)
@@ -303,17 +310,20 @@ namespace fg
         d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT;
         d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(g_dev->CreateTexture2D(&d, nullptr, tex))) return false;
-        if (FAILED(g_dev->CreateRenderTargetView(*tex, nullptr, rtv))) return false;
-        return SUCCEEDED(g_dev->CreateShaderResourceView(*tex, nullptr, srv));
+        HRESULT hr = g_dev->CreateTexture2D(&d, nullptr, tex);
+        if (FAILED(hr)) { g_last_hr = hr; log_debug("CreateTexture2D flow failed hr=0x%08lX %ux%u", hr, d.Width, d.Height); return false; }
+        hr = g_dev->CreateRenderTargetView(*tex, nullptr, rtv);
+        if (FAILED(hr)) { g_last_hr = hr; log_debug("CreateRTV flow failed hr=0x%08lX", hr); return false; }
+        hr = g_dev->CreateShaderResourceView(*tex, nullptr, srv);
+        if (FAILED(hr)) { g_last_hr = hr; log_debug("CreateSRV flow failed hr=0x%08lX", hr); return false; }
+        return true;
     }
 
     bool ensure_resources(ID3D11Texture2D *bb)
     {
         D3D11_TEXTURE2D_DESC d{};
         bb->GetDesc(&d);
-        if (d.SampleDesc.Count != 1)
-            return false;
+        if (d.SampleDesc.Count != 1) { g_status = "MSAA backbuffer unsupported"; return false; }
         if (g_prev_tex && d.Width == g_w && d.Height == g_h && d.Format == g_fmt)
             return true;
 
@@ -323,10 +333,10 @@ namespace fg
         g_lw = std::max(1u, (g_w + ds - 1) / ds);
         g_lh = std::max(1u, (g_h + ds - 1) / ds);
 
-        if (!make_capture(d, &g_prev_tex, &g_prev_srv)) return false;
-        if (!make_capture(d, &g_curr_tex, &g_curr_srv)) return false;
-        if (!make_flow(&g_flow1, &g_flow1_rtv, &g_flow1_srv)) return false;
-        if (!make_flow(&g_flow2, &g_flow2_rtv, &g_flow2_srv)) return false;
+        if (!make_capture(d, &g_prev_tex, &g_prev_srv)) { g_status = "capture texture failed"; return false; }
+        if (!make_capture(d, &g_curr_tex, &g_curr_srv)) { g_status = "capture texture failed"; return false; }
+        if (!make_flow(&g_flow1, &g_flow1_rtv, &g_flow1_srv)) { g_status = "flow texture failed"; return false; }
+        if (!make_flow(&g_flow2, &g_flow2_rtv, &g_flow2_srv)) { g_status = "flow texture failed"; return false; }
 
         log_debug("resources %ux%u flow=%ux%u ds=%u", g_w, g_h, g_lw, g_lh, ds);
         return true;
@@ -396,11 +406,12 @@ namespace fg
         g_ctx->Draw(3, 0);
     }
 
-    void draw_interpolated(ID3D11Texture2D *backbuffer)
+    bool draw_interpolated(ID3D11Texture2D *backbuffer)
     {
+        g_draw_attempts.fetch_add(1, std::memory_order_relaxed);
         ID3D11RenderTargetView *bbrtv = nullptr;
-        if (FAILED(g_dev->CreateRenderTargetView(backbuffer, nullptr, &bbrtv)) || !bbrtv)
-            return;
+        HRESULT rt_hr = g_dev->CreateRenderTargetView(backbuffer, nullptr, &bbrtv);
+        if (FAILED(rt_hr) || !bbrtv) { g_last_hr = rt_hr; g_status = "backbuffer RTV failed"; log_debug("CreateRTV backbuffer failed hr=0x%08lX", rt_hr); return false; }
 
         StateBlock s;
         save(s);
@@ -425,16 +436,24 @@ namespace fg
         g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
 
         ID3D11ShaderResourceView *nullsrv = nullptr;
-        pass(g_flow1_rtv, static_cast<float>(g_lw), static_cast<float>(g_lh), g_ps_flow, g_prev_srv, g_curr_srv, nullsrv);
-        if (g_settings.smooth)
-            pass(g_flow2_rtv, static_cast<float>(g_lw), static_cast<float>(g_lh), g_ps_smooth, nullsrv, nullsrv, g_flow1_srv);
-        pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_interp,
-             g_prev_srv, g_curr_srv, g_settings.smooth ? g_flow2_srv : g_flow1_srv);
+        if (g_settings.active_preview) {
+            pass(g_flow1_rtv, static_cast<float>(g_lw), static_cast<float>(g_lh), g_ps_flow, g_prev_srv, g_curr_srv, nullsrv);
+            if (g_settings.smooth)
+                pass(g_flow2_rtv, static_cast<float>(g_lw), static_cast<float>(g_lh), g_ps_smooth, nullsrv, nullsrv, g_flow1_srv);
+            pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_interp,
+                 g_prev_srv, g_curr_srv, g_settings.smooth ? g_flow2_srv : g_flow1_srv);
+        } else {
+            pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_interp,
+                 g_prev_srv, g_curr_srv, g_flow1_srv);
+        }
 
         ID3D11ShaderResourceView *nulls[4] = { nullptr, nullptr, nullptr, nullptr };
         g_ctx->PSSetShaderResources(0, 4, nulls);
         restore(s);
         bbrtv->Release();
+        g_draw_success.fetch_add(1, std::memory_order_relaxed);
+        g_status = g_settings.extra_present ? "generated present submitted" : "preview drawn";
+        return true;
     }
 
     bool present_generated_frame(reshade::api::effect_runtime *runtime, ID3D11Texture2D *backbuffer)
@@ -449,7 +468,8 @@ namespace fg
         // Draw the generated frame into the current backbuffer and present it immediately.
         // Then restore the real current frame into the next backbuffer so ReShade/the game can
         // continue with the normal Present. This is intentionally experimental and disabled by default.
-        draw_interpolated(backbuffer);
+        if (!draw_interpolated(backbuffer))
+            return false;
 
         g_inside_extra_present = true;
         HRESULT phr = swap->Present(0, 0);
@@ -484,22 +504,20 @@ namespace fg
             return;
         const unsigned long long frame_index = g_real_frames.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!g_settings.enabled) {
+            g_status = "disabled";
             g_have_prev = false;
             return;
         }
 
         reshade::api::device *api_device = runtime->get_device();
-        if (api_device == nullptr || api_device->get_api() != reshade::api::device_api::d3d11)
-            return;
+        if (api_device == nullptr || api_device->get_api() != reshade::api::device_api::d3d11) { g_status = "not d3d11"; return; }
 
         ID3D11Device *dev = reinterpret_cast<ID3D11Device *>(api_device->get_native());
-        if (!dev || !ensure_device(dev))
-            return;
+        if (!dev || !ensure_device(dev)) { g_status = "pipeline failed"; return; }
 
         reshade::api::resource backbuffer_resource = runtime->get_current_back_buffer();
         ID3D11Texture2D *bb = reinterpret_cast<ID3D11Texture2D *>(backbuffer_resource.handle);
-        if (!bb || !ensure_resources(bb))
-            return;
+        if (!bb || !ensure_resources(bb)) { if (!bb) g_status = "no backbuffer"; return; }
 
         g_ctx->CopyResource(g_curr_tex, bb);
         if (g_have_prev) {
@@ -512,11 +530,12 @@ namespace fg
             } else {
                 int div = std::max(1, g_settings.preview_divisor);
                 if ((frame_index % static_cast<unsigned long long>(div)) == 0) {
-                    draw_interpolated(bb);
-                    g_gen_frames.fetch_add(1, std::memory_order_relaxed);
+                    if (draw_interpolated(bb))
+                        g_gen_frames.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
+        else { g_status = "history warming up"; }
         std::swap(g_prev_tex, g_curr_tex);
         std::swap(g_prev_srv, g_curr_srv);
         g_have_prev = true;
@@ -526,6 +545,7 @@ namespace fg
 static void draw_settings_overlay(reshade::api::effect_runtime *)
 {
     ImGui::Checkbox("Enable framegen", &fg::g_settings.enabled);
+    ImGui::Checkbox("Active preview render", &fg::g_settings.active_preview);
     ImGui::Checkbox("Experimental extra Present", &fg::g_settings.extra_present);
     ImGui::SliderInt("Extra Present interval", &fg::g_settings.present_interval, 1, 4);
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
@@ -538,9 +558,12 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::SliderFloat("Strength", &fg::g_settings.strength, 0.0f, 1.0f);
     if (changed_ds) fg::release_resources();
     ImGui::Checkbox("Debug overlay", &fg::g_settings.debug_overlay);
+    ImGui::Text("Status: %s", fg::g_status);
+    ImGui::Text("Last HR: 0x%08lX", fg::g_last_hr);
     ImGui::Text("Real frames: %llu", fg::g_real_frames.load());
     ImGui::Text("Interpolated frames: %llu", fg::g_gen_frames.load());
     ImGui::Text("Extra presents: %llu", fg::g_extra_presents.load());
+    ImGui::Text("Draw attempts/success: %llu / %llu", fg::g_draw_attempts.load(), fg::g_draw_success.load());
     ImGui::Text("Flow grid: %ux%u", fg::g_lw, fg::g_lh);
     ImGui::TextDisabled("Preview mode writes into the current backbuffer. Extra Present attempts real generated-frame presentation and is experimental.");
 }
@@ -551,6 +574,7 @@ static void draw_osd_overlay(reshade::api::effect_runtime *)
         return;
     ImGui::Text("DX11 FG: %s %s", fg::g_settings.enabled ? "ON" : "OFF", fg::g_settings.extra_present ? "GEN" : "PREVIEW");
     ImGui::Text("Real %llu / Interp %llu / Presents %llu", fg::g_real_frames.load(), fg::g_gen_frames.load(), fg::g_extra_presents.load());
+    ImGui::Text("Status: %s", fg::g_status);
 }
 
 static void on_reshade_present(reshade::api::effect_runtime *runtime)
