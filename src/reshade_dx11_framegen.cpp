@@ -38,6 +38,8 @@ namespace fg
         bool extra_present = false;
         bool active_preview = true;
         bool visible_test = false;
+        bool pace = true;          // even out present spacing (adds up to ~1 generated-frame of latency)
+        int multiplier = 2;        // total output frames per real frame: 2 = 1 generated, 3 = 2, 4 = 3
         int present_interval = 1;
         int preview_divisor = 1;
         int flow_downscale = 24;
@@ -54,6 +56,14 @@ namespace fg
     bool g_inside_extra_present = false;
     const char *g_status = "idle";
     HRESULT g_last_hr = S_OK;
+
+    // Frame-pacing state (high-resolution timer).
+    LARGE_INTEGER g_qpc_freq = {};
+    double g_dt_ema = 0.0;          // smoothed native frame interval (excludes our pacing waits)
+    double g_prev_cb_entry = 0.0;   // QPC seconds at the previous present callback entry
+    double g_last_wait_total = 0.0; // seconds spent pacing in the previous callback
+    double g_slot = 0.0;            // free-running schedule clock: target time of next present
+    double g_paced_ms = 0.0;        // last callback's total pacing wait, for the overlay
 
     ID3D11Device *g_dev = nullptr;
     ID3D11DeviceContext *g_ctx = nullptr;
@@ -102,8 +112,8 @@ namespace fg
         int patchP, ds;
         int usePyramid, smoothFlow;
         int hudProtect, fastMode;
-        float strength;
-        float pad[5]; // pad FlowCB to 80 bytes (multiple of 16) so CreateBuffer succeeds
+        float strength, phase;
+        float pad[4]; // FlowCB is 80 bytes (multiple of 16) so CreateBuffer succeeds
     };
 
     const char *kShader = R"HLSL(
@@ -114,7 +124,7 @@ namespace fg
             int patchP,ds;
             int usePyramid,smoothFlow;
             int hudProtect,fastMode;
-            float strength,pad1,pad2,pad3;
+            float strength,phase,pad2,pad3;
         };
         Texture2D texPrev : register(t0);
         Texture2D texCurr : register(t1);
@@ -182,17 +192,31 @@ namespace fg
             return acc / 9.0;
         }
         float4 PSMain(VSOut i) : SV_Target {
+            float t = saturate(phase);                 // temporal position: 0 = prev, 1 = curr
             float4 f = flowTex.SampleLevel(smp, i.uv, 0);
             float2 ouv = f.xy * float2(invW, invH);
             float conf = saturate(f.z) * saturate(strength);
-            float4 a = texPrev.SampleLevel(smp, i.uv + 0.5 * ouv, 0);
-            float4 b = texCurr.SampleLevel(smp, i.uv - 0.5 * ouv, 0);
-            float consist = saturate(1.0 - abs(luma(a.rgb) - luma(b.rgb)) * 4.0);
-            float w = conf * consist;
+
+            // Warp each source to time t along the flow.
+            float4 a = texPrev.SampleLevel(smp, i.uv + t * ouv, 0);
+            float4 b = texCurr.SampleLevel(smp, i.uv - (1.0 - t) * ouv, 0);
+
+            // Where the forward and backward warps disagree, the flow is crossing an
+            // occlusion/disocclusion boundary. Blending there is exactly what smears ghost
+            // trails, so detect it and fall back to the temporally nearest real frame.
+            float disagree = abs(luma(a.rgb) - luma(b.rgb));
+            float consist = saturate(1.0 - disagree * 4.0);
+            float occl = saturate(disagree * 6.0);
+
             float4 pc = texPrev.SampleLevel(smp, i.uv, 0);
             float4 cc = texCurr.SampleLevel(smp, i.uv, 0);
-            float4 plain = lerp(pc, cc, 0.5);
-            float4 warped = lerp(a, b, 0.5);
+            float4 plain = lerp(pc, cc, t);
+            float4 warped = lerp(a, b, t);
+
+            float4 nearest = (t < 0.5) ? pc : cc;
+            warped = lerp(warped, nearest, occl);      // de-ghost at occlusion edges
+
+            float w = conf * consist;
             float4 outc = lerp(plain, warped, w);
             if (hudProtect != 0) {
                 float3 d3 = abs(pc.rgb - cc.rgb);
@@ -217,6 +241,36 @@ namespace fg
     }
 
     template <typename T> void safe_release(T *&p) { if (p) { p->Release(); p = nullptr; } }
+
+    double now_seconds()
+    {
+        if (g_qpc_freq.QuadPart == 0)
+            QueryPerformanceFrequency(&g_qpc_freq);
+        LARGE_INTEGER c;
+        QueryPerformanceCounter(&c);
+        return static_cast<double>(c.QuadPart) / static_cast<double>(g_qpc_freq.QuadPart);
+    }
+
+    // Busy/sleep hybrid: sleep coarsely while far from the target, then spin for the last
+    // ~1.5 ms so the present lands close to the scheduled time. Clamped so a bad estimate
+    // can never stall longer than max_wait seconds.
+    void wait_until(double target, double max_wait)
+    {
+        double start = now_seconds();
+        double deadline = start + max_wait;
+        if (target > deadline)
+            target = deadline;
+        for (;;) {
+            double now = now_seconds();
+            if (now >= target)
+                break;
+            double rem = target - now;
+            if (rem > 0.0015)
+                Sleep(1);
+            else
+                YieldProcessor();
+        }
+    }
 
     void clear_bbrtv_cache()
     {
@@ -446,7 +500,7 @@ namespace fg
         return rtv;
     }
 
-    bool draw_interpolated(ID3D11Texture2D *backbuffer)
+    bool draw_interpolated(ID3D11Texture2D *backbuffer, float phase = 0.5f, bool compute_flow = true)
     {
         g_draw_attempts.fetch_add(1, std::memory_order_relaxed);
         ID3D11RenderTargetView *bbrtv = get_bb_rtv(backbuffer);
@@ -471,20 +525,21 @@ namespace fg
         cb.hudProtect = g_settings.hud_protect ? 1 : 0;
         cb.fastMode = g_settings.fast_mode ? 1 : 0;
         cb.strength = g_settings.strength;
+        cb.phase = phase;
         g_ctx->UpdateSubresource(g_cb, 0, nullptr, &cb, 0, 0);
         g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
 
         ID3D11ShaderResourceView *nullsrv = nullptr;
-        if (g_settings.active_preview) {
+        // Optical flow only depends on prev/curr, not on the phase, so for multi-phase
+        // output we compute it once (compute_flow) and reuse g_flow1/g_flow2 for the rest.
+        bool use_smooth = g_settings.active_preview && g_settings.smooth;
+        if (compute_flow) {
             pass(g_flow1_rtv, static_cast<float>(g_lw), static_cast<float>(g_lh), g_ps_flow, g_prev_srv, g_curr_srv, nullsrv);
-            if (g_settings.smooth)
+            if (use_smooth)
                 pass(g_flow2_rtv, static_cast<float>(g_lw), static_cast<float>(g_lh), g_ps_smooth, nullsrv, nullsrv, g_flow1_srv);
-            pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_interp,
-                 g_prev_srv, g_curr_srv, g_settings.smooth ? g_flow2_srv : g_flow1_srv);
-        } else {
-            pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_interp,
-                 g_prev_srv, g_curr_srv, g_flow1_srv);
         }
+        pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_interp,
+             g_prev_srv, g_curr_srv, use_smooth ? g_flow2_srv : g_flow1_srv);
 
         ID3D11ShaderResourceView *nulls[4] = { nullptr, nullptr, nullptr, nullptr };
         g_ctx->PSSetShaderResources(0, 4, nulls);
@@ -494,7 +549,7 @@ namespace fg
         return true;
     }
 
-    bool present_generated_frame(reshade::api::effect_runtime *runtime, ID3D11Texture2D *backbuffer)
+    bool present_generated_frame(reshade::api::effect_runtime *runtime, ID3D11Texture2D *backbuffer, float phase, bool compute_flow)
     {
         if (g_inside_extra_present)
             return false;
@@ -505,8 +560,8 @@ namespace fg
 
         // Draw the generated frame into the current backbuffer and present it immediately.
         // Then restore the real current frame into the next backbuffer so ReShade/the game can
-        // continue with the normal Present. This is intentionally experimental and disabled by default.
-        if (!draw_interpolated(backbuffer))
+        // continue with the normal Present.
+        if (!draw_interpolated(backbuffer, phase, compute_flow))
             return false;
 
         g_inside_extra_present = true;
@@ -559,12 +614,47 @@ namespace fg
         if (!bb || !ensure_resources(bb)) { if (!bb) g_status = "no backbuffer"; return; }
 
         g_ctx->CopyResource(g_curr_tex, bb);
+
+        // Track the native frame interval (callback-to-callback minus the time we spent pacing
+        // last frame), so the pacer schedules against the game's real cadence, not its own waits.
+        double cb_entry = now_seconds();
+        if (g_prev_cb_entry > 0.0) {
+            double native = (cb_entry - g_prev_cb_entry) - g_last_wait_total;
+            if (native > 0.0001 && native < 0.5)
+                g_dt_ema = (g_dt_ema > 0.0) ? (g_dt_ema * 0.9 + native * 0.1) : native;
+        }
+        g_prev_cb_entry = cb_entry;
+        double wait_total = 0.0;
+
         if (g_have_prev) {
             if (g_settings.extra_present) {
-                int div = std::max(1, g_settings.present_interval);
-                if ((frame_index % static_cast<unsigned long long>(div)) == 0) {
-                    if (present_generated_frame(runtime, bb))
+                int mult = std::clamp(g_settings.multiplier, 2, 4);
+                int gens = mult - 1;
+                bool do_pace = g_settings.pace && g_dt_ema > 0.0;
+                double spacing = do_pace ? (g_dt_ema / static_cast<double>(mult)) : 0.0;
+
+                // Resync the free-running schedule after a hitch / alt-tab / pause.
+                if (do_pace && (g_slot <= 0.0 || g_slot < cb_entry - g_dt_ema || g_slot > cb_entry + g_dt_ema))
+                    g_slot = cb_entry;
+
+                // Emit the (mult-1) interpolated phases, then let the real frame present last.
+                // Flow is phase-independent, so only the first phase computes it.
+                for (int k = 1; k <= gens; k++) {
+                    if (do_pace) {
+                        double b = now_seconds();
+                        wait_until(g_slot, g_dt_ema);
+                        wait_total += now_seconds() - b;
+                        g_slot += spacing;
+                    }
+                    float t = static_cast<float>(k) / static_cast<float>(mult);
+                    if (present_generated_frame(runtime, bb, t, k == 1))
                         g_gen_frames.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (do_pace) {
+                    double b = now_seconds();
+                    wait_until(g_slot, g_dt_ema);   // hold the real frame to its slot (the latency)
+                    wait_total += now_seconds() - b;
+                    g_slot += spacing;
                 }
             } else {
                 int div = std::max(1, g_settings.preview_divisor);
@@ -575,6 +665,9 @@ namespace fg
             }
         }
         else { g_status = "history warming up"; }
+
+        g_last_wait_total = wait_total;
+        g_paced_ms = wait_total * 1000.0;
         std::swap(g_prev_tex, g_curr_tex);
         std::swap(g_prev_srv, g_curr_srv);
         g_have_prev = true;
@@ -586,7 +679,8 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Checkbox("Enable framegen", &fg::g_settings.enabled);
     ImGui::Checkbox("Active preview render", &fg::g_settings.active_preview);
     ImGui::Checkbox("Experimental extra Present", &fg::g_settings.extra_present);
-    ImGui::SliderInt("Extra Present interval", &fg::g_settings.present_interval, 1, 4);
+    ImGui::SliderInt("Frame multiplier (x)", &fg::g_settings.multiplier, 2, 4);
+    ImGui::Checkbox("Pace frames (adds ~1 frame latency)", &fg::g_settings.pace);
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
     ImGui::Checkbox("Fast mode", &fg::g_settings.fast_mode);
     ImGui::Checkbox("Fast search", &fg::g_settings.fast_search);
@@ -604,6 +698,7 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Text("Extra presents: %llu", fg::g_extra_presents.load());
     ImGui::Text("Draw attempts/success: %llu / %llu", fg::g_draw_attempts.load(), fg::g_draw_success.load());
     ImGui::Text("Flow grid: %ux%u", fg::g_lw, fg::g_lh);
+    ImGui::Text("Native frame: %.2f ms | paced wait: %.2f ms", fg::g_dt_ema * 1000.0, fg::g_paced_ms);
     ImGui::TextDisabled("Preview mode writes into the current backbuffer. Extra Present attempts real generated-frame presentation and is experimental.");
 }
 
