@@ -43,6 +43,8 @@ namespace fg
         bool use_depth = false;    // depth-assisted disocclusion (only active once a depth buffer is found)
         int present_sync = 0;      // injected-present sync interval: 0 = immediate, 1 = wait for vblank
         bool effects_once = true;  // skip ReShade's effect chain on injected frames (they inherit it from the real frames)
+        bool aa = false;           // depth-aware spatial edge AA (experimental; adds a full-screen pass)
+        float aa_strength = 0.6f;  // AA blend amount (0..1)
         int multiplier = 2;        // total output frames per real frame: 2 = 1 generated, 3 = 2, 4 = 3
         int present_interval = 1;
         int preview_divisor = 1;
@@ -82,9 +84,17 @@ namespace fg
     ID3D11PixelShader *g_ps_flow = nullptr;
     ID3D11PixelShader *g_ps_smooth = nullptr;
     ID3D11PixelShader *g_ps_interp = nullptr;
+    ID3D11PixelShader *g_ps_aa = nullptr;
     ID3D11SamplerState *g_smp = nullptr;
     ID3D11BlendState *g_blend = nullptr;
     ID3D11Buffer *g_cb = nullptr;
+
+    // Temporal AA resources: a readable copy of the current frame and a persistent history.
+    ID3D11Texture2D *g_aa_src = nullptr;
+    ID3D11ShaderResourceView *g_aa_src_srv = nullptr;
+    ID3D11Texture2D *g_aa_hist = nullptr;
+    ID3D11ShaderResourceView *g_aa_hist_srv = nullptr;
+    bool g_aa_have_hist = false;
 
     ID3D11Texture2D *g_prev_tex = nullptr;
     ID3D11ShaderResourceView *g_prev_srv = nullptr;
@@ -125,7 +135,8 @@ namespace fg
         int hudProtect, fastMode;
         float strength, phase;
         int useDepth;
-        float pad[3]; // FlowCB is 80 bytes (multiple of 16) so CreateBuffer succeeds
+        float aaBlend;
+        float pad[2]; // FlowCB is 80 bytes (multiple of 16) so CreateBuffer succeeds
     };
 
     const char *kShader = R"HLSL(
@@ -138,7 +149,8 @@ namespace fg
             int hudProtect,fastMode;
             float strength,phase;
             int useDepth;
-            float pad1,pad2,pad3;
+            float aaBlend;
+            float pad2,pad3;
         };
         Texture2D texPrev : register(t0);
         Texture2D texCurr : register(t1);
@@ -250,6 +262,40 @@ namespace fg
                 outc.rgb = lerp(outc.rgb, cc.rgb, staticMask);
             }
             return outc;
+        }
+
+        // Depth-aware spatial edge AA. Source frame is bound to texPrev (t0); depth to t3.
+        // FXAA-style luma edge detect, blend along the edge, with the blend eased back across
+        // strong depth discontinuities so silhouettes don't halo onto the background.
+        float4 PSAA(VSOut i) : SV_Target {
+            float2 px = float2(invW, invH);
+            float3 c  = texPrev.SampleLevel(smp, i.uv, 0).rgb;
+            float lC = luma(c);
+            float lN = luma(texPrev.SampleLevel(smp, i.uv + float2(0.0, -px.y), 0).rgb);
+            float lS = luma(texPrev.SampleLevel(smp, i.uv + float2(0.0,  px.y), 0).rgb);
+            float lE = luma(texPrev.SampleLevel(smp, i.uv + float2( px.x, 0.0), 0).rgb);
+            float lW = luma(texPrev.SampleLevel(smp, i.uv + float2(-px.x, 0.0), 0).rgb);
+            float lMin = min(lC, min(min(lN, lS), min(lE, lW)));
+            float lMax = max(lC, max(max(lN, lS), max(lE, lW)));
+            float range = lMax - lMin;
+            if (range < 0.04)
+                return float4(c, 1.0);                 // flat area: leave crisp
+
+            float2 grad = float2(lE - lW, lS - lN);
+            float2 edgeDir = normalize(float2(-grad.y, grad.x) + 1e-5);
+            float3 s1 = texPrev.SampleLevel(smp, i.uv + edgeDir * px, 0).rgb;
+            float3 s2 = texPrev.SampleLevel(smp, i.uv - edgeDir * px, 0).rgb;
+            float3 aa = (s1 + s2 + c) / 3.0;
+
+            float guard = 1.0;
+            if (useDepth != 0) {
+                float dC = depthTex.SampleLevel(smp, i.uv, 0).r;
+                float dE = abs(depthTex.SampleLevel(smp, i.uv + float2(px.x, 0.0), 0).r - dC);
+                float dY = abs(depthTex.SampleLevel(smp, i.uv + float2(0.0, px.y), 0).r - dC);
+                guard = lerp(1.0, 0.5, saturate((dE + dY) * 40.0));
+            }
+            float amount = saturate(range * 4.0) * saturate(strength) * guard;
+            return float4(lerp(c, aa, amount), 1.0);
         }
     )HLSL";
 
@@ -443,6 +489,7 @@ namespace fg
         clear_bbrtv_cache();
         safe_release(g_prev_srv); safe_release(g_prev_tex);
         safe_release(g_curr_srv); safe_release(g_curr_tex);
+        safe_release(g_aa_src_srv); safe_release(g_aa_src);
         safe_release(g_flow1_srv); safe_release(g_flow1_rtv); safe_release(g_flow1);
         safe_release(g_flow2_srv); safe_release(g_flow2_rtv); safe_release(g_flow2);
         g_have_prev = false;
@@ -455,7 +502,7 @@ namespace fg
         depth_reset();
         release_resources();
         safe_release(g_cb); safe_release(g_blend); safe_release(g_smp);
-        safe_release(g_ps_interp); safe_release(g_ps_smooth); safe_release(g_ps_flow); safe_release(g_vs);
+        safe_release(g_ps_interp); safe_release(g_ps_smooth); safe_release(g_ps_flow); safe_release(g_ps_aa); safe_release(g_vs);
         safe_release(g_ctx); safe_release(g_dev);
         g_pipeline_ready = false;
     }
@@ -498,6 +545,13 @@ namespace fg
         g_last_hr = g_dev->CreatePixelShader(pi->GetBufferPointer(), pi->GetBufferSize(), nullptr, &g_ps_interp);
         if (FAILED(g_last_hr)) { g_status = "interp PS create failed"; safe_release(vs); safe_release(pf); safe_release(psm); safe_release(pi); return false; }
         safe_release(vs); safe_release(pf); safe_release(psm); safe_release(pi);
+
+        // AA shader is optional: failure here must not block frame generation.
+        ID3DBlob *pa = nullptr;
+        if (compile_one("PSAA", "ps_5_0", &pa) && pa) {
+            g_dev->CreatePixelShader(pa->GetBufferPointer(), pa->GetBufferSize(), nullptr, &g_ps_aa);
+            safe_release(pa);
+        }
 
         D3D11_SAMPLER_DESC sd{};
         sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -573,6 +627,7 @@ namespace fg
 
         if (!make_capture(d, &g_prev_tex, &g_prev_srv)) { g_status = "capture texture failed"; return false; }
         if (!make_capture(d, &g_curr_tex, &g_curr_srv)) { g_status = "capture texture failed"; return false; }
+        make_capture(d, &g_aa_src, &g_aa_src_srv);   // optional AA source; ignore failure
         if (!make_flow(&g_flow1, &g_flow1_rtv, &g_flow1_srv)) { g_status = "flow texture failed"; return false; }
         if (!make_flow(&g_flow2, &g_flow2_rtv, &g_flow2_srv)) { g_status = "flow texture failed"; return false; }
 
@@ -790,6 +845,47 @@ namespace fg
         return true;
     }
 
+    // Depth-aware spatial AA applied to the real backbuffer. Runs before the frame is captured,
+    // so the generated frames inherit the AA'd result through interpolation and the whole output
+    // stays consistent. Costs one copy + one full-screen pass per real frame.
+    void apply_aa(ID3D11Texture2D *backbuffer)
+    {
+        if (!g_ps_aa || !g_aa_src || !g_aa_src_srv)
+            return;
+        ID3D11RenderTargetView *bbrtv = get_bb_rtv(backbuffer);
+        if (!bbrtv)
+            return;
+
+        g_ctx->CopyResource(g_aa_src, backbuffer);   // SRV-readable snapshot to read while we write bb
+
+        StateBlock s;
+        save(s);
+        const FLOAT bf[4] = {0, 0, 0, 0};
+        g_ctx->OMSetBlendState(g_blend, bf, 0xffffffff);
+        g_ctx->IASetInputLayout(nullptr);
+        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_ctx->VSSetShader(g_vs, nullptr, 0);
+        g_ctx->PSSetSamplers(0, 1, &g_smp);
+
+        FlowCB cb{};
+        cb.W = g_w; cb.H = g_h;
+        cb.invW = 1.0f / static_cast<float>(g_w);
+        cb.invH = 1.0f / static_cast<float>(g_h);
+        cb.strength = g_settings.aa_strength;     // AA shader reads 'strength' as its blend amount
+        ID3D11ShaderResourceView *dsrv = g_settings.use_depth ? depth_current_srv() : nullptr;
+        cb.useDepth = dsrv ? 1 : 0;
+        g_ctx->UpdateSubresource(g_cb, 0, nullptr, &cb, 0, 0);
+        g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
+
+        ID3D11ShaderResourceView *nullsrv = nullptr;
+        g_ctx->PSSetShaderResources(3, 1, &dsrv);
+        pass(bbrtv, static_cast<float>(g_w), static_cast<float>(g_h), g_ps_aa, g_aa_src_srv, nullsrv, nullsrv);
+
+        ID3D11ShaderResourceView *nulls[4] = { nullptr, nullptr, nullptr, nullptr };
+        g_ctx->PSSetShaderResources(0, 4, nulls);
+        restore(s);
+    }
+
     void run(reshade::api::effect_runtime *runtime)
     {
         if (g_inside_extra_present)
@@ -812,6 +908,8 @@ namespace fg
         ID3D11Texture2D *bb = reinterpret_cast<ID3D11Texture2D *>(backbuffer_resource.handle);
         if (!bb || !ensure_resources(bb)) { if (!bb) g_status = "no backbuffer"; return; }
 
+        if (g_settings.aa)
+            apply_aa(bb);            // AA the real frame first so generated frames inherit it
         g_ctx->CopyResource(g_curr_tex, bb);
 
         // Track the native frame interval (callback-to-callback minus the time we spent pacing
@@ -892,6 +990,9 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     }
     ImGui::Checkbox("Depth-assisted de-ghosting", &fg::g_settings.use_depth);
     ImGui::Checkbox("Skip ReShade effects on generated frames", &fg::g_settings.effects_once);
+    ImGui::Checkbox("Depth-aware AA (experimental, costs a pass)", &fg::g_settings.aa);
+    if (fg::g_settings.aa)
+        ImGui::SliderFloat("AA strength", &fg::g_settings.aa_strength, 0.0f, 1.0f);
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
     ImGui::Checkbox("Fast mode", &fg::g_settings.fast_mode);
     ImGui::Checkbox("Fast search", &fg::g_settings.fast_search);
