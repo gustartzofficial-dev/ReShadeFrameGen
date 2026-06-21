@@ -1,5 +1,9 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -32,7 +36,7 @@ namespace fg
         bool fast_mode = true;
         int preview_divisor = 1;
         int flow_downscale = 24;
-        int fast_search = 1;
+        bool fast_search = true;
         float strength = 0.75f;
     };
 
