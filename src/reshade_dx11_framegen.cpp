@@ -76,6 +76,16 @@ namespace fg
     ID3D11RenderTargetView *g_flow2_rtv = nullptr;
     ID3D11ShaderResourceView *g_flow2_srv = nullptr;
 
+    // Cache of backbuffer render-target views, keyed by the backbuffer texture pointer.
+    // Flip-model swapchains rotate through a small set of backbuffers, so a tiny cache
+    // removes the per-frame CreateRenderTargetView/Release churn. The texture pointer is
+    // stored as an identity key only (never dereferenced or released); the cache owns the
+    // RTV ref. Cleared on resize/shutdown via release_resources(), so keys never dangle
+    // within a single swapchain generation.
+    struct BBRtvCacheEntry { ID3D11Texture2D *tex; ID3D11RenderTargetView *rtv; };
+    BBRtvCacheEntry g_bbrtv_cache[8] = {};
+    int g_bbrtv_count = 0;
+
     bool g_pipeline_ready = false;
     bool g_have_prev = false;
     unsigned g_w = 0, g_h = 0, g_lw = 0, g_lh = 0;
@@ -208,8 +218,17 @@ namespace fg
 
     template <typename T> void safe_release(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
+    void clear_bbrtv_cache()
+    {
+        for (int i = 0; i < g_bbrtv_count; i++)
+            safe_release(g_bbrtv_cache[i].rtv);
+        for (auto &e : g_bbrtv_cache) { e.tex = nullptr; e.rtv = nullptr; }
+        g_bbrtv_count = 0;
+    }
+
     void release_resources()
     {
+        clear_bbrtv_cache();
         safe_release(g_prev_srv); safe_release(g_prev_tex);
         safe_release(g_curr_srv); safe_release(g_curr_tex);
         safe_release(g_flow1_srv); safe_release(g_flow1_rtv); safe_release(g_flow1);
@@ -411,12 +430,27 @@ namespace fg
         g_ctx->Draw(3, 0);
     }
 
+    ID3D11RenderTargetView *get_bb_rtv(ID3D11Texture2D *bb)
+    {
+        for (int i = 0; i < g_bbrtv_count; i++)
+            if (g_bbrtv_cache[i].tex == bb)
+                return g_bbrtv_cache[i].rtv;
+        ID3D11RenderTargetView *rtv = nullptr;
+        HRESULT hr = g_dev->CreateRenderTargetView(bb, nullptr, &rtv);
+        if (FAILED(hr) || !rtv) { g_last_hr = hr; return nullptr; }
+        if (g_bbrtv_count < 8) {
+            g_bbrtv_cache[g_bbrtv_count].tex = bb;   // identity key only, not AddRef'd
+            g_bbrtv_cache[g_bbrtv_count].rtv = rtv;   // cache owns this ref
+            g_bbrtv_count++;
+        }
+        return rtv;
+    }
+
     bool draw_interpolated(ID3D11Texture2D *backbuffer)
     {
         g_draw_attempts.fetch_add(1, std::memory_order_relaxed);
-        ID3D11RenderTargetView *bbrtv = nullptr;
-        HRESULT rt_hr = g_dev->CreateRenderTargetView(backbuffer, nullptr, &bbrtv);
-        if (FAILED(rt_hr) || !bbrtv) { g_last_hr = rt_hr; g_status = "backbuffer RTV failed"; log_debug("CreateRTV backbuffer failed hr=0x%08lX", rt_hr); return false; }
+        ID3D11RenderTargetView *bbrtv = get_bb_rtv(backbuffer);
+        if (!bbrtv) { g_status = "backbuffer RTV failed"; log_debug("CreateRTV backbuffer failed hr=0x%08lX", g_last_hr); return false; }
 
         StateBlock s;
         save(s);
@@ -455,7 +489,6 @@ namespace fg
         ID3D11ShaderResourceView *nulls[4] = { nullptr, nullptr, nullptr, nullptr };
         g_ctx->PSSetShaderResources(0, 4, nulls);
         restore(s);
-        bbrtv->Release();
         g_draw_success.fetch_add(1, std::memory_order_relaxed);
         g_status = g_settings.extra_present ? "generated present submitted" : "preview drawn";
         return true;
