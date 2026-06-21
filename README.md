@@ -84,3 +84,14 @@ If enabling preview tanks FPS, start with:
 - Preview every N frames: 2 or 3
 
 This add-on currently runs optical-flow preview inside ReShade, so it is not expected to behave like true extra-present FSR3 yet. The immediate goal is a fast stable motion-preview path before experimenting with generated-present insertion.
+
+## Experimental generated-frame presentation
+
+This build adds an **Experimental extra Present** toggle. Preview mode still renders the interpolated image into the current backbuffer. Extra Present mode attempts a true generated-frame presentation:
+
+1. Copy the current real frame into private history.
+2. Generate the interpolated frame from previous/current history.
+3. Present that generated frame immediately.
+4. Restore the real current frame to the next swapchain buffer so the normal game/ReShade present can continue.
+
+This is intentionally risky and disabled by default. If it stutters, flickers, or crashes in a game, turn it off and use preview mode while we tune the pacing path.

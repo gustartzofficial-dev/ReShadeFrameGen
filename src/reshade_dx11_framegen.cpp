@@ -34,6 +34,8 @@ namespace fg
         bool hud_protect = true;
         bool debug_overlay = true;
         bool fast_mode = true;
+        bool extra_present = false;
+        int present_interval = 1;
         int preview_divisor = 1;
         int flow_downscale = 24;
         bool fast_search = true;
@@ -43,6 +45,8 @@ namespace fg
     Settings g_settings;
     std::atomic<unsigned long long> g_real_frames{0};
     std::atomic<unsigned long long> g_gen_frames{0};
+    std::atomic<unsigned long long> g_extra_presents{0};
+    bool g_inside_extra_present = false;
 
     ID3D11Device *g_dev = nullptr;
     ID3D11DeviceContext *g_ctx = nullptr;
@@ -432,8 +436,51 @@ namespace fg
         bbrtv->Release();
     }
 
+    bool present_generated_frame(reshade::api::effect_runtime *runtime, ID3D11Texture2D *backbuffer)
+    {
+        if (g_inside_extra_present)
+            return false;
+
+        IDXGISwapChain *swap = reinterpret_cast<IDXGISwapChain *>(runtime->get_native());
+        if (!swap)
+            return false;
+
+        // Draw the generated frame into the current backbuffer and present it immediately.
+        // Then restore the real current frame into the next backbuffer so ReShade/the game can
+        // continue with the normal Present. This is intentionally experimental and disabled by default.
+        draw_interpolated(backbuffer);
+
+        g_inside_extra_present = true;
+        HRESULT phr = swap->Present(0, 0);
+        g_inside_extra_present = false;
+        if (FAILED(phr)) {
+            log_debug("extra Present failed hr=0x%08lX", phr);
+            return false;
+        }
+
+        ID3D11Texture2D *restore_bb = nullptr;
+        IDXGISwapChain3 *swap3 = nullptr;
+        if (SUCCEEDED(swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swap3))) && swap3) {
+            UINT idx = swap3->GetCurrentBackBufferIndex();
+            swap3->GetBuffer(idx, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&restore_bb));
+            swap3->Release();
+        }
+        if (!restore_bb) {
+            // Fallback for older swapchains: buffer zero is often the current backbuffer in blt-model.
+            swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&restore_bb));
+        }
+        if (restore_bb) {
+            g_ctx->CopyResource(restore_bb, g_curr_tex);
+            restore_bb->Release();
+        }
+        g_extra_presents.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
     void run(reshade::api::effect_runtime *runtime)
     {
+        if (g_inside_extra_present)
+            return;
         const unsigned long long frame_index = g_real_frames.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!g_settings.enabled) {
             g_have_prev = false;
@@ -455,10 +502,18 @@ namespace fg
 
         g_ctx->CopyResource(g_curr_tex, bb);
         if (g_have_prev) {
-            int div = std::max(1, g_settings.preview_divisor);
-            if ((frame_index % static_cast<unsigned long long>(div)) == 0) {
-                draw_interpolated(bb);
-                g_gen_frames.fetch_add(1, std::memory_order_relaxed);
+            if (g_settings.extra_present) {
+                int div = std::max(1, g_settings.present_interval);
+                if ((frame_index % static_cast<unsigned long long>(div)) == 0) {
+                    if (present_generated_frame(runtime, bb))
+                        g_gen_frames.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                int div = std::max(1, g_settings.preview_divisor);
+                if ((frame_index % static_cast<unsigned long long>(div)) == 0) {
+                    draw_interpolated(bb);
+                    g_gen_frames.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
         std::swap(g_prev_tex, g_curr_tex);
@@ -469,7 +524,9 @@ namespace fg
 
 static void draw_settings_overlay(reshade::api::effect_runtime *)
 {
-    ImGui::Checkbox("Enable framegen preview", &fg::g_settings.enabled);
+    ImGui::Checkbox("Enable framegen", &fg::g_settings.enabled);
+    ImGui::Checkbox("Experimental extra Present", &fg::g_settings.extra_present);
+    ImGui::SliderInt("Extra Present interval", &fg::g_settings.present_interval, 1, 4);
     ImGui::Checkbox("Pyramid optical flow", &fg::g_settings.pyramid);
     ImGui::Checkbox("Fast mode", &fg::g_settings.fast_mode);
     ImGui::Checkbox("Fast search", &fg::g_settings.fast_search);
@@ -482,16 +539,17 @@ static void draw_settings_overlay(reshade::api::effect_runtime *)
     ImGui::Checkbox("Debug overlay", &fg::g_settings.debug_overlay);
     ImGui::Text("Real frames: %llu", fg::g_real_frames.load());
     ImGui::Text("Interpolated frames: %llu", fg::g_gen_frames.load());
+    ImGui::Text("Extra presents: %llu", fg::g_extra_presents.load());
     ImGui::Text("Flow grid: %ux%u", fg::g_lw, fg::g_lh);
-    ImGui::TextDisabled("Preview writes one interpolated frame into the current backbuffer. No extra Present yet.");
+    ImGui::TextDisabled("Preview mode writes into the current backbuffer. Extra Present attempts real generated-frame presentation and is experimental.");
 }
 
 static void draw_osd_overlay(reshade::api::effect_runtime *)
 {
     if (!fg::g_settings.debug_overlay)
         return;
-    ImGui::Text("DX11 FG: %s", fg::g_settings.enabled ? "ON" : "OFF");
-    ImGui::Text("Real %llu / Interp %llu", fg::g_real_frames.load(), fg::g_gen_frames.load());
+    ImGui::Text("DX11 FG: %s %s", fg::g_settings.enabled ? "ON" : "OFF", fg::g_settings.extra_present ? "GEN" : "PREVIEW");
+    ImGui::Text("Real %llu / Interp %llu / Presents %llu", fg::g_real_frames.load(), fg::g_gen_frames.load(), fg::g_extra_presents.load());
 }
 
 static void on_reshade_present(reshade::api::effect_runtime *runtime)
