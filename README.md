@@ -1,3 +1,14 @@
+
+## Build output
+
+A ReShade add-on is internally a Windows DLL/PE binary. The build therefore lets MSVC create `ReShadeFrameGen.dll` normally, then CMake publishes the exact same finished binary as:
+
+```text
+build/addon/ReShadeFrameGen.addon64
+```
+
+**Use the `.addon64` file in the game.** The intermediate `.dll` is only the linker output and does not need to be installed. If you built v0.1 already, you can simply rename that `ReShadeFrameGen.dll` to `ReShadeFrameGen.addon64`; the bytes do not need to change.
+
 # ReShadeFrameGen — clean-slate DLSS-G host
 
 This is a **from-scratch replacement** for the old optical-flow / extra-`Present()` experiment.

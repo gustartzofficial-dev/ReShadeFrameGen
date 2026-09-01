@@ -66,11 +66,22 @@ endif()
 
 target_link_libraries(ReShadeFrameGen PRIVATE user32)
 
-# Emit one ReShade add-on file, not a confusing .dll + copied .addon pair.
+# ReShade add-ons are PE DLL binaries. Keep the compiler/linker output as a
+# normal DLL for maximum MSVC/CMake compatibility, then publish a loader-facing
+# .addon64 copy in a deterministic directory.
 set_target_properties(ReShadeFrameGen PROPERTIES
     PREFIX ""
-    SUFFIX ".addon64"
     OUTPUT_NAME "ReShadeFrameGen"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/addon"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/addon"
+)
+
+set(RESH_FRAMEGEN_ADDON_DIR "${CMAKE_BINARY_DIR}/addon")
+set(RESH_FRAMEGEN_ADDON_FILE "${RESH_FRAMEGEN_ADDON_DIR}/ReShadeFrameGen.addon64")
+
+add_custom_command(TARGET ReShadeFrameGen POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${RESH_FRAMEGEN_ADDON_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:ReShadeFrameGen>"
+            "${RESH_FRAMEGEN_ADDON_FILE}"
+    COMMENT "Publishing ReShade add-on: ${RESH_FRAMEGEN_ADDON_FILE}"
+    VERBATIM
 )
