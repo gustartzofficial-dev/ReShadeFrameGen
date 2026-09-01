@@ -50,7 +50,7 @@ constexpr std::array<sl::Feature, 3> k_requested_features = {
 // A stable project identifier for this open-source host experiment. Streamline accepts a projectId
 // in place of an NVIDIA applicationId; this is not pretending to be another game's application ID.
 constexpr const char *k_project_id = "68c3c204-a7b9-43e0-a319-37b62eef12f7";
-constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.2";
+constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.2.1";
 
 void set_note(Snapshot &s, const char *note)
 {

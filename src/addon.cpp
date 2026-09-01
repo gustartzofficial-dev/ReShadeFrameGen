@@ -19,9 +19,9 @@
 #include "feeder_probe.hpp"
 #include "streamline_host.hpp"
 
-extern "C" __declspec(dllexport) const char *NAME = "ReShade FrameGen - DLSS-G Host 0.2 Bootstrap";
+extern "C" __declspec(dllexport) const char *NAME = "ReShade FrameGen - DLSS-G Host 0.2.1 Bootstrap";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Clean-slate DLSS-G bootstrap/controller. Finds and loads the real Streamline DLLs, requests DLSS-G/Reflex/PCL early, "
+    "Clean-slate DLSS-G bootstrap/controller (0.2.1 build fix). Finds and loads the real Streamline DLLs, requests DLSS-G/Reflex/PCL early, "
     "submits the real D3D11/D3D12 game device, and only arms NVIDIA Frame Generation when Streamline presentation is actually attached.";
 
 namespace
@@ -141,7 +141,7 @@ void draw_overlay(reshade::api::effect_runtime *)
     const fg::guides::Snapshot guides = fg::guides::snapshot();
     const fg::slhost::Snapshot s = fg::slhost::snapshot();
 
-    ImGui::TextUnformatted("DLSS-G Host 0.2 - active bootstrap test");
+    ImGui::TextUnformatted("DLSS-G Host 0.2.1 - bootstrap test");
     ImGui::TextDisabled("No legacy interpolation. No fake extra Present. Uses the real NVIDIA Streamline/DLSS-G DLLs.");
     ImGui::Separator();
 
@@ -186,7 +186,7 @@ void draw_overlay(reshade::api::effect_runtime *)
     ImGui::Text("slIsFeatureLoaded(DLSS-G): %s", fg::slhost::result_name(s.last_is_loaded));
 
     if (d.renodx_dlss5_loaded)
-        ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "[ OK ] renodx-dlss5.addon64 loaded (RenoDX DLSS5/NR host)");
+        ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "[ OK ] renodx-dlss5.addon64 loaded (RenoDX DLSS5 host; version-agnostic)");
     if (d.renodx_dlss_loaded)
         ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "[ OK ] renodx-dlss.addon64 loaded");
 

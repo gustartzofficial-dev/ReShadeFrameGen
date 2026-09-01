@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <unknwn.h> // IUnknown / COM QueryInterface used for Streamline proxy detection
 #include <cstdint>
 #include <string>
 
