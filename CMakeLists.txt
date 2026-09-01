@@ -18,7 +18,7 @@ if(NOT reshade_sdk_POPULATED)
     FetchContent_Populate(reshade_sdk)
 endif()
 
-# The hybrid/true-additive wrapper includes the repository's existing
+# The hybrid/Frankenstein wrapper includes the repository's existing
 # src/reshade_dx11_framegen.cpp directly. Compile ONLY this wrapper to avoid
 # duplicate definitions while preserving the old implementation as fallback.
 add_library(ReShadeDX11FrameGen SHARED

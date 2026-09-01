@@ -43,9 +43,10 @@ namespace fgx
         // 2 = V3 isolated presenter (kept for A/B),
         // 3 = V4 fullscreen compositor: FreeGen/Magpie style zero-copy output surface,
         // 4 = V5 native deep queue: LSFG-style game swapchain expansion + FIFO/vblank queueing.
-        // V5 is default in this test branch so create_swapchain is armed before the game creates
-        // its first DXGI swapchain. All older modes remain selectable afterwards.
-        int output_mode = 4;
+        // V6 deliberately starts in legacy/pass-through mode. Native swapchain surgery is armed
+        // only after the real game runtime is known and the user explicitly selects V6. This
+        // prevents splash/launcher/temporary swapchains from being modified during process start.
+        int output_mode = 0;
         bool presenter_hide_unfocused = true;
         bool presenter_self_pacing = true;
         bool presenter_allow_tearing = true;
@@ -53,7 +54,7 @@ namespace fgx
         bool presenter_cap_to_refresh = false; // never silently force x2 back to 60 Hz
         bool presenter_force_topmost = true;
         bool deep_queue_force_vsync = true;
-        bool deep_queue_raise_fullscreen_refresh = true;
+        bool deep_queue_raise_fullscreen_refresh = false;
         bool deep_queue_force_flip_model = false; // Special-K-style compatibility lever; restart required
         int deep_queue_extra_buffers = 2; // one delayed real frame + one x2 intermediate
         bool reuse_legacy_postprocess = false; // AA/temporal reconstruction stay legacy-only unless explicitly requested
@@ -495,7 +496,7 @@ namespace fgx
     std::atomic<long> g_presenter_last_hr{S_OK};
     std::atomic<const char *> g_presenter_status{"off"};
 
-    // V5 native/deep-queue telemetry. ReShade's create_swapchain callback runs before DXGI creates
+    // V6 native/deep-queue telemetry. ReShade's create_swapchain callback runs before DXGI creates
     // the game swapchain, which lets us transplant the key lsfg-vk trick: add images to the GAME'S
     // OWN queue, then let FIFO/vblank pacing consume generated + real frames instead of sleeping
     // inside the game's render callback.
@@ -510,6 +511,14 @@ namespace fgx
     std::atomic<unsigned long long> g_deep_queue_primary_area{0};
     std::atomic<bool> g_deep_queue_latency_applied{false};
     std::atomic<long> g_deep_queue_latency_hr{S_OK};
+    std::atomic<unsigned> g_deep_queue_requested_buffers{0};
+    std::atomic<const char *> g_deep_queue_gate_status{"not armed - game startup untouched"};
+
+    // V6 remembers the largest top-level D3D11 ReShade runtime that has actually initialized.
+    // The native queue hook is allowed to touch only that HWND. This is the key difference from
+    // V5, which modified every D3D11 swapchain including splash/intro surfaces.
+    std::atomic<HWND> g_primary_game_hwnd{nullptr};
+    std::atomic<unsigned long long> g_primary_game_area{0};
     // ReShade 6.7.3 / add-on API 18 has no low-level finish_present event. Track the
     // native-output contract with the counters the original add-on already owns instead:
     // real callback frames + successful injected Presents. This is deliberately labelled
@@ -614,119 +623,173 @@ namespace fgx
         return mode == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL || mode == DXGI_SWAP_EFFECT_FLIP_DISCARD;
     }
 
-    // Optional Special-K-style promotion lever. A full Special K implementation uses a proxy
-    // backbuffer to cover compatibility edge cases; ReShade's create_swapchain event cannot
-    // replace the COM swapchain pointer, so this deliberately stays opt-in. It is most useful
-    // for windowed/borderless DX11 games that still request old BLT swap effects.
-    bool maybe_promote_to_flip(reshade::api::swapchain_desc &desc)
+    uint64_t client_area(HWND hwnd)
     {
-        if (!g_settings.deep_queue_force_flip_model || desc.fullscreen_state || desc.back_buffer.texture.samples != 1)
-            return false;
-
-        if (desc.present_mode == DXGI_SWAP_EFFECT_DISCARD) {
-            desc.present_mode = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-            desc.back_buffer_count = std::max(desc.back_buffer_count, 2u);
-            return true;
-        }
-        if (desc.present_mode == DXGI_SWAP_EFFECT_SEQUENTIAL) {
-            desc.present_mode = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-            desc.back_buffer_count = std::max(desc.back_buffer_count, 2u);
-            return true;
-        }
-        return false;
+        if (!hwnd)
+            return 0;
+        RECT r{};
+        if (!GetClientRect(hwnd, &r))
+            return 0;
+        const uint64_t w = static_cast<uint64_t>(std::max<LONG>(0, r.right - r.left));
+        const uint64_t h = static_cast<uint64_t>(std::max<LONG>(0, r.bottom - r.top));
+        return w * h;
     }
 
-    // LSFG-style native queue surgery. ReShade preserves a sync_interval supplied by a
-    // create_swapchain add-on and applies it to later DXGI Presents. This gives us both parts of
-    // the mechanism lsfg-vk relies on: enough native backbuffers for generated+real images and a
-    // FIFO/vblank consumer. The interpolation shader is still ours.
+    bool is_top_level_game_window(HWND hwnd)
+    {
+        if (!hwnd || !IsWindow(hwnd))
+            return false;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != GetCurrentProcessId())
+            return false;
+        if (GetAncestor(hwnd, GA_ROOT) != hwnd)
+            return false;
+        const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if ((style & WS_CHILD) != 0 || (ex & WS_EX_TOOLWINDOW) != 0)
+            return false;
+        return true;
+    }
+
+    void remember_primary_runtime(HWND hwnd)
+    {
+        if (!is_top_level_game_window(hwnd))
+            return;
+        const uint64_t area = client_area(hwnd);
+        if (area < 320ull * 180ull)
+            return;
+        const uint64_t old = g_primary_game_area.load(std::memory_order_relaxed);
+        HWND fg = GetForegroundWindow();
+        const bool is_foreground_root = fg && GetAncestor(fg, GA_ROOT) == hwnd;
+        if (is_foreground_root || !g_primary_game_hwnd.load(std::memory_order_relaxed) || area >= old) {
+            g_primary_game_area.store(area, std::memory_order_relaxed);
+            g_primary_game_hwnd.store(hwnd, std::memory_order_release);
+        }
+    }
+
+    // V6 safe late-arm native queue surgery.
+    //
+    // ReShade 6.7.3 runs create_swapchain not only during initial creation, but again from
+    // IDXGISwapChain::ResizeBuffers. V6 exploits that: startup stays completely untouched. After
+    // the real effect runtime has initialized and the user selects V6, the next normal game
+    // ResizeBuffers (resolution/window-mode change) reaches this callback and deepens ONLY the
+    // already-known primary game swapchain.
     bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc &desc, void *hwnd_ptr)
     {
         if (g_settings.output_mode != 4 || api != reshade::api::device_api::d3d11 || hwnd_ptr == nullptr)
             return false;
 
         HWND hwnd = reinterpret_cast<HWND>(hwnd_ptr);
-        HWND presenter_hwnd = g_presenter_hwnd.load(std::memory_order_acquire);
-        if (presenter_hwnd && hwnd == presenter_hwnd)
+        const HWND primary = g_primary_game_hwnd.load(std::memory_order_acquire);
+        if (!primary) {
+            g_deep_queue_gate_status.store("armed - waiting for primary game runtime", std::memory_order_relaxed);
             return false;
+        }
+        if (hwnd != primary) {
+            g_deep_queue_gate_status.store("ignored non-primary swapchain", std::memory_order_relaxed);
+            return false;
+        }
+        if (!is_top_level_game_window(hwnd)) {
+            g_deep_queue_gate_status.store("rejected: not a top-level game HWND", std::memory_order_relaxed);
+            return false;
+        }
+        if (desc.fullscreen_state) {
+            // First safe build is borderless/windowed only. Exclusive mode changes refresh/target
+            // state during swapchain recreation and was one of V5's highest-risk startup paths.
+            g_deep_queue_gate_status.store("rejected: exclusive fullscreen (use borderless/windowed)", std::memory_order_relaxed);
+            return false;
+        }
+        if (desc.back_buffer.texture.samples != 1) {
+            g_deep_queue_gate_status.store("rejected: multisampled swapchain", std::memory_order_relaxed);
+            return false;
+        }
+        uint32_t surface_w = desc.back_buffer.texture.width;
+        uint32_t surface_h = desc.back_buffer.texture.height;
+        if (surface_w == 0 || surface_h == 0) {
+            RECT r{};
+            if (GetClientRect(hwnd, &r)) {
+                surface_w = static_cast<uint32_t>(std::max<LONG>(0, r.right - r.left));
+                surface_h = static_cast<uint32_t>(std::max<LONG>(0, r.bottom - r.top));
+            }
+        }
+        if (surface_w < 320 || surface_h < 180) {
+            g_deep_queue_gate_status.store("rejected: tiny/temporary surface", std::memory_order_relaxed);
+            return false;
+        }
 
-        const uint32_t requested_original_count = desc.back_buffer_count;
-        const uint32_t requested_present_mode = desc.present_mode;
-        bool modified = maybe_promote_to_flip(desc);
-        const bool promoted_flip = desc.present_mode != requested_present_mode;
+        const uint32_t pm = desc.present_mode;
+        if (pm != DXGI_SWAP_EFFECT_DISCARD && pm != DXGI_SWAP_EFFECT_SEQUENTIAL &&
+            pm != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL && pm != DXGI_SWAP_EFFECT_FLIP_DISCARD) {
+            g_deep_queue_gate_status.store("rejected: unsupported DXGI swap effect", std::memory_order_relaxed);
+            return false;
+        }
 
-        const uint32_t original = std::max(1u, requested_original_count);
-        const uint32_t extra = static_cast<uint32_t>(std::clamp(g_settings.deep_queue_extra_buffers, 1, 4));
-        const uint32_t desired = std::min(8u, std::max(4u, original + extra));
+        const uint32_t requested_original_count = std::max(1u, desc.back_buffer_count);
+        const uint32_t extra = static_cast<uint32_t>(std::clamp(g_settings.deep_queue_extra_buffers, 1, 3));
+        const uint32_t desired = std::min(8u, std::max(3u, requested_original_count + extra));
 
+        bool modified = false;
         if (desc.back_buffer_count < desired) {
             desc.back_buffer_count = desired;
             modified = true;
         }
 
+        // Do not rewrite swap effect, fullscreen refresh, tearing capability or any other creation
+        // flag in V6. We only deepen BufferCount and optionally override ReShade's Present sync.
         if (g_settings.deep_queue_force_vsync && desc.sync_interval != 1u) {
             desc.sync_interval = 1u;
-            desc.present_flags &= ~static_cast<uint32_t>(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
             modified = true;
         }
 
-        if (g_settings.deep_queue_raise_fullscreen_refresh && desc.fullscreen_state) {
-            const float desktop_hz = presenter_query_refresh_hz(hwnd);
-            if (desktop_hz > 1.0f &&
-                (desc.fullscreen_refresh_rate <= 1.0f || desktop_hz > desc.fullscreen_refresh_rate + 0.5f)) {
-                desc.fullscreen_refresh_rate = desktop_hz;
-                modified = true;
-            }
-        }
+        g_deep_queue_original_buffers.store(requested_original_count, std::memory_order_relaxed);
+        g_deep_queue_requested_buffers.store(desired, std::memory_order_relaxed);
+        g_deep_queue_created_buffers.store(desc.back_buffer_count, std::memory_order_relaxed);
+        g_deep_queue_forced_sync.store(desc.sync_interval, std::memory_order_relaxed);
+        g_deep_queue_original_present_mode.store(pm, std::memory_order_relaxed);
+        g_deep_queue_created_present_mode.store(pm, std::memory_order_relaxed);
+        g_deep_queue_flip_promoted.store(false, std::memory_order_relaxed);
+        g_deep_queue_hwnd.store(hwnd, std::memory_order_release);
+        g_deep_queue_patched.store(false, std::memory_order_release); // becomes true only after successful init
+        g_deep_queue_gate_status.store(modified ? "patch requested - waiting for ResizeBuffers success" : "already compatible - waiting for init", std::memory_order_relaxed);
 
-        // Patch all D3D11 presentation swapchains, but use the largest HWND as telemetry/FG target
-        // so a tiny video/launcher swapchain created later does not steal the counters.
-        uint64_t w = desc.back_buffer.texture.width;
-        uint64_t h = desc.back_buffer.texture.height;
-        if (w == 0 || h == 0) {
-            RECT r{};
-            if (GetClientRect(hwnd, &r)) { w = static_cast<uint64_t>(std::max(0L, r.right - r.left)); h = static_cast<uint64_t>(std::max(0L, r.bottom - r.top)); }
-        }
-        const uint64_t area = w * h;
-        uint64_t previous_area = g_deep_queue_primary_area.load(std::memory_order_relaxed);
-        if (!g_deep_queue_hwnd.load(std::memory_order_relaxed) || area >= previous_area) {
-            g_deep_queue_primary_area.store(area, std::memory_order_relaxed);
-            g_deep_queue_patched.store(true, std::memory_order_release);
-            g_deep_queue_original_buffers.store(requested_original_count, std::memory_order_relaxed);
-            g_deep_queue_created_buffers.store(desc.back_buffer_count, std::memory_order_relaxed);
-            g_deep_queue_forced_sync.store(desc.sync_interval, std::memory_order_relaxed);
-            g_deep_queue_original_present_mode.store(requested_present_mode, std::memory_order_relaxed);
-            g_deep_queue_created_present_mode.store(desc.present_mode, std::memory_order_relaxed);
-            g_deep_queue_flip_promoted.store(promoted_flip, std::memory_order_relaxed);
-            g_deep_queue_hwnd.store(hwnd, std::memory_order_release);
-            const unsigned long long total_now =
-                fg::g_real_frames.load(std::memory_order_relaxed) +
-                fg::g_extra_presents.load(std::memory_order_relaxed);
-            g_deep_queue_present_count.store(0, std::memory_order_relaxed);
-            g_deep_queue_output_fps.store(0.0f, std::memory_order_relaxed);
-            g_deep_queue_counter_origin.store(total_now, std::memory_order_relaxed);
-            g_deep_queue_last_sample_total.store(total_now, std::memory_order_relaxed);
-            g_deep_queue_last_present_ts.store(0.0, std::memory_order_relaxed);
-        }
+        const unsigned long long total_now =
+            fg::g_real_frames.load(std::memory_order_relaxed) +
+            fg::g_extra_presents.load(std::memory_order_relaxed);
+        g_deep_queue_present_count.store(0, std::memory_order_relaxed);
+        g_deep_queue_output_fps.store(0.0f, std::memory_order_relaxed);
+        g_deep_queue_counter_origin.store(total_now, std::memory_order_relaxed);
+        g_deep_queue_last_sample_total.store(total_now, std::memory_order_relaxed);
+        g_deep_queue_last_present_ts.store(0.0, std::memory_order_relaxed);
         return modified;
     }
 
-    void on_init_swapchain(reshade::api::swapchain *swapchain, bool)
+    void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     {
-        if (!swapchain || g_settings.output_mode != 4)
+        if (!swapchain)
             return;
         HWND hwnd = reinterpret_cast<HWND>(swapchain->get_hwnd());
-        if (hwnd && hwnd == g_deep_queue_hwnd.load(std::memory_order_acquire)) {
-            const uint32_t actual = swapchain->get_back_buffer_count();
-            g_deep_queue_created_buffers.store(actual, std::memory_order_relaxed);
+        if (hwnd)
+            remember_primary_runtime(hwnd);
 
-            IDXGISwapChain *native_swap = reinterpret_cast<IDXGISwapChain *>(swapchain->get_native());
-            DXGI_SWAP_CHAIN_DESC native_desc{};
-            if (native_swap && SUCCEEDED(native_swap->GetDesc(&native_desc))) {
-                g_deep_queue_created_present_mode.store(static_cast<uint32_t>(native_desc.SwapEffect), std::memory_order_relaxed);
-            }
-            g_deep_queue_patched.store(actual >= 4, std::memory_order_release);
+        if (g_settings.output_mode != 4 || hwnd != g_deep_queue_hwnd.load(std::memory_order_acquire))
+            return;
+
+        const uint32_t actual = swapchain->get_back_buffer_count();
+        g_deep_queue_created_buffers.store(actual, std::memory_order_relaxed);
+
+        IDXGISwapChain *native_swap = reinterpret_cast<IDXGISwapChain *>(swapchain->get_native());
+        DXGI_SWAP_CHAIN_DESC native_desc{};
+        if (native_swap && SUCCEEDED(native_swap->GetDesc(&native_desc))) {
+            g_deep_queue_created_present_mode.store(static_cast<uint32_t>(native_desc.SwapEffect), std::memory_order_relaxed);
         }
+
+        const uint32_t wanted = g_deep_queue_requested_buffers.load(std::memory_order_relaxed);
+        const bool ok = wanted >= 3 && actual >= wanted;
+        g_deep_queue_patched.store(ok, std::memory_order_release);
+        g_deep_queue_gate_status.store(ok ? (resize ? "ACTIVE - late ResizeBuffers patch succeeded" : "ACTIVE")
+                                          : "patch did not take - game kept original buffer count",
+                                       std::memory_order_relaxed);
     }
 
     void update_deep_queue_telemetry(reshade::api::effect_runtime *runtime)
@@ -1505,8 +1568,8 @@ namespace fgx
 
     void run_original_with_output_mode(reshade::api::effect_runtime *runtime)
     {
-        // V5 keeps the existing interpolation and backbuffer-restore code, but changes the
-        // scheduling contract. The game swapchain is deepened in on_create_swapchain and forced
+        // V6 keeps the existing interpolation and backbuffer-restore code, but changes the
+        // scheduling contract. The game swapchain is deepened only after late-arm ResizeBuffers and optionally forced
         // to FIFO/vblank. We emit one generated Present with no software sleep and then return;
         // the game's untouched real Present becomes the next image in that same native queue.
         const bool legacy_immediate = (g_settings.output_mode == 1) && fg::g_settings.extra_present;
@@ -1541,7 +1604,7 @@ namespace fgx
         fg::run(runtime);
 
         if (deep_queue_requested && !deep_queue_ready)
-            fg::g_status = "V5 waiting for patched game swapchain - restart or recreate swapchain";
+            fg::g_status = "V6 armed - change resolution/window mode once to apply native queue";
 
         fg::g_settings.extra_present = saved_extra;
         fg::g_settings.pace = saved_pace;
@@ -1648,7 +1711,7 @@ namespace fgx
             "Legacy: immediate extra Present (no wait)",
             "TRUE ADDITIVE V3: isolated presenter (A/B only)",
             "FRANKENSTEIN V4: zero-copy fullscreen compositor",
-            "FRANKENSTEIN V5: native deep swapchain queue (recommended)"
+            "FRANKENSTEIN V6 SAFE: late-arm native queue"
         };
         int old_output_mode = g_settings.output_mode;
         if (ImGui::Combo("Output backend", &g_settings.output_mode, output_items, 5)) {
@@ -1663,44 +1726,47 @@ namespace fgx
             fg::g_paced_ms = 0.0;
             fg::g_last_present_ts = 0.0;
             g_presenter_next_slot = 0.0;
-            if (g_settings.output_mode == 4 && !g_deep_queue_patched.load(std::memory_order_acquire))
-                fg::g_status = "V5 selected - recreate/restart swapchain so deep queue hook can apply";
+            if (g_settings.output_mode == 4 && !g_deep_queue_patched.load(std::memory_order_acquire)) {
+                g_deep_queue_gate_status.store(g_primary_game_hwnd.load(std::memory_order_acquire) ?
+                    "armed - waiting for primary swapchain ResizeBuffers" : "armed - waiting for primary game runtime",
+                    std::memory_order_relaxed);
+                fg::g_status = "V6 armed safely - change resolution/window mode once; DO NOT restart just to apply";
+            }
             else if (old_output_mode == 4 && g_settings.output_mode != 4)
-                fg::g_status = "Left V5 - recreate/restart swapchain to restore the game's original Present contract";
+                fg::g_status = "Left V6 - next normal ResizeBuffers restores the game's requested buffer count";
         }
 
         if (g_settings.output_mode == 4) {
             bool recreate_needed = false;
-            if (ImGui::Checkbox("Force FIFO / VSync=1 on game swapchain", &g_settings.deep_queue_force_vsync)) recreate_needed = true;
-            if (ImGui::Checkbox("Raise exclusive-fullscreen refresh to desktop refresh", &g_settings.deep_queue_raise_fullscreen_refresh)) recreate_needed = true;
-            if (ImGui::Checkbox("Experimental: promote BLT swapchain to flip-model", &g_settings.deep_queue_force_flip_model)) recreate_needed = true;
-            if (ImGui::SliderInt("Extra native swapchain buffers", &g_settings.deep_queue_extra_buffers, 1, 4)) recreate_needed = true;
+            if (ImGui::Checkbox("Force FIFO / VSync=1 after late-arm patch", &g_settings.deep_queue_force_vsync)) recreate_needed = true;
+            if (ImGui::SliderInt("Extra native swapchain buffers", &g_settings.deep_queue_extra_buffers, 1, 3)) recreate_needed = true;
             if (recreate_needed) {
                 g_deep_queue_patched.store(false, std::memory_order_release);
-                fg::g_status = "V5 swapchain settings changed - restart/resize/toggle display mode";
+                g_deep_queue_gate_status.store("settings changed - trigger one more ResizeBuffers", std::memory_order_relaxed);
+                fg::g_status = "V6 settings changed - change resolution/window mode once";
             }
-            ImGui::TextDisabled("V5 scavenges lsfg-vk's scheduling trick: deepen the GAME swapchain, then queue generated + real frames into one FIFO/vblank stream.");
-            ImGui::TextDisabled("It forces x2 + Extra Present internally and bypasses the old software Pace wait; FrameGen Preview values are restored when leaving V5.");
-            ImGui::Text("Native swapchain patch: %s", g_deep_queue_patched.load(std::memory_order_acquire) ? "ACTIVE" : "NOT APPLIED - RECREATE/RESTART");
-            ImGui::Text("Backbuffers original/actual: %u -> %u | forced SyncInterval: %s",
+            ImGui::TextDisabled("V6 does NOT touch startup/splash swapchains. It arms only after the real game runtime exists.");
+            ImGui::TextDisabled("To apply: select V6, keep borderless/windowed, then change resolution or window mode once and return.");
+            ImGui::TextDisabled("No BLT->flip conversion, no fullscreen refresh rewrite, no tearing-flag rewrite in this safety build.");
+            ImGui::Text("Gate: %s", g_deep_queue_gate_status.load(std::memory_order_relaxed));
+            ImGui::Text("Primary HWND: %p | patched HWND: %p",
+                reinterpret_cast<void *>(g_primary_game_hwnd.load(std::memory_order_relaxed)),
+                reinterpret_cast<void *>(g_deep_queue_hwnd.load(std::memory_order_relaxed)));
+            ImGui::Text("Native queue patch: %s", g_deep_queue_patched.load(std::memory_order_acquire) ? "ACTIVE" : "not active");
+            ImGui::Text("Backbuffers original/requested/actual: %u -> %u -> %u | SyncInterval: %s",
                 g_deep_queue_original_buffers.load(std::memory_order_relaxed),
+                g_deep_queue_requested_buffers.load(std::memory_order_relaxed),
                 g_deep_queue_created_buffers.load(std::memory_order_relaxed),
                 g_deep_queue_forced_sync.load(std::memory_order_relaxed) == 1u ? "1 (FIFO/vblank)" : "application/default");
-            const uint32_t original_mode = g_deep_queue_original_present_mode.load(std::memory_order_relaxed);
             const uint32_t active_mode = g_deep_queue_created_present_mode.load(std::memory_order_relaxed);
-            ImGui::Text("Present model: %s -> %s%s",
-                dxgi_present_mode_name(original_mode), dxgi_present_mode_name(active_mode),
-                g_deep_queue_flip_promoted.load(std::memory_order_relaxed) ? " (promoted)" : "");
-            if (!dxgi_present_mode_is_flip(active_mode))
-                ImGui::TextDisabled("BLT-model detected. If V5 still collapses to game FPS, enable experimental flip promotion and restart.");
+            ImGui::Text("Present model (unchanged by V6): %s", dxgi_present_mode_name(active_mode));
             ImGui::Text("DXGI max-frame-latency expansion: %s (HR 0x%08lX)",
                 g_deep_queue_latency_applied.load(std::memory_order_acquire) ? "ACTIVE" : "not applied",
                 static_cast<unsigned long>(g_deep_queue_latency_hr.load(std::memory_order_relaxed)));
             ImGui::Text("Submitted native frames: %llu | submitted output stream: %.1f FPS",
                 g_deep_queue_present_count.load(std::memory_order_relaxed),
                 g_deep_queue_output_fps.load(std::memory_order_relaxed));
-            ImGui::TextDisabled("That submitted stream counts BOTH our generated Present and the game's real-frame callback cadence; use it instead of an in-game counter that only reports real frames.");
-            ImGui::TextDisabled("A physical 60 Hz desktop cannot show 120 unique frames. 60 real -> 120 visible needs Windows/monitor output at 120 Hz or higher.");
+            ImGui::TextDisabled("If Gate says rejected, V6 has deliberately left the swapchain untouched rather than risking a launch crash.");
         }
         else if (g_settings.output_mode == 2 || g_settings.output_mode == 3) {
             ImGui::Checkbox("Self-pace generated output", &g_settings.presenter_self_pacing);
@@ -1718,7 +1784,7 @@ namespace fgx
             if (g_settings.output_mode == 3)
                 ImGui::TextDisabled("V4 is the FreeGen/Magpie-style fallback: a top-level zero-copy compositor owns visible output.");
             else
-                ImGui::TextDisabled("V3 is retained only for regression/A-B testing; V5 is the primary path now.");
+                ImGui::TextDisabled("V3 is retained only for regression/A-B testing; V6 is the primary native-queue experiment now.");
             ImGui::Text("Presenter: %s", g_presenter_status.load(std::memory_order_relaxed));
             ImGui::Text("Game real: %.1f FPS | target output: %.1f FPS | actual output: %.1f FPS",
                 g_presenter_game_fps.load(std::memory_order_relaxed),
@@ -1756,7 +1822,7 @@ namespace fgx
             if (g_external_mv_effect[0] != '\0')
                 ImGui::Text("Provider effect: %s", g_external_mv_effect);
             ImGui::Text("Backend: %s", g_extension_status);
-            static const char *out_names[] = { "Legacy paced", "Legacy immediate", "V3 isolated presenter", "V4 zero-copy compositor", "V5 native deep queue" };
+            static const char *out_names[] = { "Legacy paced", "Legacy immediate", "V3 isolated presenter", "V4 zero-copy compositor", "V6 safe late-arm native queue" };
             ImGui::Text("Output mode: %s", out_names[std::clamp(g_settings.output_mode, 0, 4)]);
             ImGui::TextDisabled("Uses the community UV-space texMotionVectors contract (qUINT / ReShadeMotionEstimation / Feeder ecosystem).");
             ImGui::TextDisabled("No NVIDIA DLLs are bundled. DLSS/NR effects may still run normally before reshade_present; this addon then interpolates the resulting real frames.");
@@ -1787,6 +1853,12 @@ namespace fgx
             return;
         const HWND hwnd = reinterpret_cast<HWND>(runtime->get_hwnd());
 
+        // Remember the actual initialized game runtime before V6 is ever armed. This makes the
+        // later create_swapchain/ResizeBuffers hook target-specific instead of process-wide.
+        reshade::api::device *runtime_device = runtime->get_device();
+        if (runtime_device && runtime_device->get_api() == reshade::api::device_api::d3d11)
+            remember_primary_runtime(hwnd);
+
         if (g_settings.output_mode == 4 && hwnd && hwnd == g_deep_queue_hwnd.load(std::memory_order_acquire)) {
             reshade::api::device *api_device = runtime->get_device();
             if (api_device && api_device->get_api() == reshade::api::device_api::d3d11) {
@@ -1797,7 +1869,8 @@ namespace fgx
                     // DXGI defaults can throttle the producer before our deeper BufferCount matters.
                     // Let at least the native queue depth exist; this intentionally trades one
                     // frame of latency for additive output, just like the universal FG donors.
-                    const UINT latency = std::clamp<UINT>(g_deep_queue_created_buffers.load(std::memory_order_relaxed), 3u, 8u);
+                    const UINT created = g_deep_queue_created_buffers.load(std::memory_order_relaxed);
+                    const UINT latency = std::clamp<UINT>(created ? created : 3u, 3u, 8u);
                     hr = dxgi1->SetMaximumFrameLatency(latency);
                     dxgi1->Release();
                 }
