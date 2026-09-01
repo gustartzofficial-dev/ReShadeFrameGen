@@ -10,6 +10,7 @@
 
 #include <d3d11_4.h>
 #include <dxgi1_4.h>
+#include <dxgi1_5.h>
 #include <thread>
 #include <condition_variable>
 #include <deque>
@@ -39,8 +40,10 @@ namespace fgx
         // 0 = original in-swapchain pacing, 1 = legacy immediate extra-Present,
         // 2 = independent presenter (real additive output, DX11 windowed/borderless).
         int output_mode = 0;
-        bool presenter_vsync = true;
         bool presenter_hide_unfocused = true;
+        bool presenter_self_pacing = true;
+        bool presenter_allow_tearing = true;
+        bool reuse_legacy_postprocess = false; // AA/temporal reconstruction stay legacy-only unless explicitly requested
         bool show_status = true;
     };
 
@@ -423,7 +426,9 @@ namespace fgx
     ID3D11Device *g_presenter_device = nullptr; // borrowed identity; detects device recreation
     ID3D11Multithread *g_presenter_mt = nullptr;
     BOOL g_presenter_prev_mt = FALSE;
-    HANDLE g_presenter_latency_waitable = nullptr; // owned by DXGI; do not CloseHandle
+    HANDLE g_presenter_latency_waitable = nullptr; // kept for ABI/state cleanup; V2 does not use it for pacing
+    reshade::api::effect_runtime *g_presenter_effect_runtime = nullptr; // borrowed; secondary ReShade runtime if one is created
+    thread_local bool g_inside_presenter_present = false;
     std::thread g_presenter_thread;
     std::mutex g_presenter_mutex;
     std::condition_variable g_presenter_cv;
@@ -438,7 +443,13 @@ namespace fgx
     std::atomic<unsigned long long> g_presenter_generated_presents{0};
     std::atomic<unsigned long long> g_presenter_dropped_packets{0};
     std::atomic<float> g_presenter_output_fps{0.0f};
+    std::atomic<float> g_presenter_game_fps{0.0f};
+    std::atomic<float> g_presenter_target_fps{0.0f};
+    std::atomic<double> g_presenter_native_interval{1.0 / 60.0};
     double g_presenter_last_present_time = 0.0; // presenter thread only
+    double g_presenter_next_slot = 0.0;          // presenter thread only
+    float g_presenter_refresh_hz = 0.0f;
+    bool g_presenter_tearing_supported = false;
     const char *g_presenter_status = "off";
 
     LRESULT CALLBACK presenter_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -491,7 +502,10 @@ namespace fgx
         g_presenter_width = g_presenter_height = 0;
         g_presenter_format = DXGI_FORMAT_UNKNOWN;
         g_presenter_last_present_time = 0.0;
+        g_presenter_next_slot = 0.0;
         g_presenter_output_fps.store(0.0f, std::memory_order_relaxed);
+        g_presenter_target_fps.store(0.0f, std::memory_order_relaxed);
+        g_presenter_tearing_supported = false;
     }
 
     void presenter_hide_window()
@@ -587,6 +601,20 @@ namespace fgx
         return true;
     }
 
+    float presenter_query_refresh_hz(HWND hwnd)
+    {
+        HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (!mon || !GetMonitorInfoW(mon, &mi))
+            return 0.0f;
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) || dm.dmDisplayFrequency <= 1)
+            return 0.0f;
+        return static_cast<float>(dm.dmDisplayFrequency);
+    }
+
     bool presenter_make_texture(UINT w, UINT h, DXGI_FORMAT fmt, ID3D11Texture2D **out)
     {
         D3D11_TEXTURE2D_DESC d{};
@@ -631,6 +659,17 @@ namespace fgx
             return false;
         }
 
+        // True Additive must not use Present(1) or the old frame-latency waitable object as its
+        // clock. Detect tearing support and submit Present(0) from our own paced worker instead.
+        BOOL allow_tearing = FALSE;
+        IDXGIFactory5 *factory5 = nullptr;
+        if (SUCCEEDED(factory->QueryInterface(__uuidof(IDXGIFactory5), reinterpret_cast<void **>(&factory5))) && factory5) {
+            if (FAILED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing, sizeof(allow_tearing))))
+                allow_tearing = FALSE;
+            factory5->Release();
+        }
+        g_presenter_tearing_supported = allow_tearing == TRUE;
+
         DXGI_SWAP_CHAIN_DESC1 sd{};
         sd.Width = w; sd.Height = h;
         sd.Format = fmt;
@@ -641,7 +680,7 @@ namespace fgx
         sd.Scaling = DXGI_SCALING_STRETCH;
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-        sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        sd.Flags = (g_settings.presenter_allow_tearing && g_presenter_tearing_supported) ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u;
 
         hr = factory->CreateSwapChainForHwnd(fg::g_dev, g_presenter_hwnd, &sd, nullptr, nullptr, &g_presenter_swap);
         factory->MakeWindowAssociation(g_presenter_hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
@@ -653,12 +692,9 @@ namespace fgx
             return false;
         }
 
-        IDXGISwapChain2 *swap2 = nullptr;
-        if (SUCCEEDED(g_presenter_swap->QueryInterface(__uuidof(IDXGISwapChain2), reinterpret_cast<void **>(&swap2))) && swap2) {
-            swap2->SetMaximumFrameLatency(1);
-            g_presenter_latency_waitable = swap2->GetFrameLatencyWaitableObject();
-            swap2->Release();
-        }
+        // Do not call SetMaximumFrameLatency(1) here: with two output Presents per real frame it
+        // can turn DXGI queue pressure into another hidden throttle. The worker below owns pacing.
+        g_presenter_latency_waitable = nullptr;
         if (SUCCEEDED(g_presenter_swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_presenter_swap3))) && g_presenter_swap3) {
             // Mirror the obvious color-space choice for common SDR/HDR backbuffer formats.
             // If the driver rejects it, presentation still continues using the swapchain default.
@@ -691,7 +727,8 @@ namespace fgx
         g_presenter_width = w;
         g_presenter_height = h;
         g_presenter_format = fmt;
-        g_presenter_status = "ready";
+        g_presenter_refresh_hz = presenter_query_refresh_hz(game_hwnd);
+        g_presenter_status = "ready (legacy Present path isolated)";
         presenter_sync_window();
         return true;
     }
@@ -711,10 +748,16 @@ namespace fgx
         // inject unnecessary command-stream flushes into the game's shared D3D11 device.
         bb->Release();
 
-        // VSync here blocks only the independent presenter thread. That is the crucial difference
-        // from the legacy path: the game is free to render its next real frame while this thread
-        // waits for the generated/real output slots.
-        hr = g_presenter_swap->Present(g_settings.presenter_vsync ? 1u : 0u, 0);
+        // Never use Present(1) in True Additive. It turns every generated/real submission into a
+        // vblank wait and collapses a 60->120 target back toward 60 once the DXGI queue fills.
+        // Also guard this secondary swapchain from re-entering our ReShade present callback.
+        const UINT present_flags = (g_settings.presenter_allow_tearing && g_presenter_tearing_supported) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+        g_inside_presenter_present = true;
+        const bool old_inside_extra = fg::g_inside_extra_present;
+        fg::g_inside_extra_present = true;
+        hr = g_presenter_swap->Present(0u, present_flags);
+        fg::g_inside_extra_present = old_inside_extra;
+        g_inside_presenter_present = false;
         if (SUCCEEDED(hr)) {
             const double t = fg::now_seconds();
             if (g_presenter_last_present_time > 0.0) {
@@ -737,6 +780,32 @@ namespace fgx
         }
         fg::g_last_hr = hr;
         return false;
+    }
+
+    double presenter_output_interval()
+    {
+        double native = g_presenter_native_interval.load(std::memory_order_relaxed);
+        if (!(native > 0.0001 && native < 0.5))
+            native = 1.0 / 60.0;
+        double target_fps = 2.0 / native;
+        if (g_presenter_refresh_hz > 1.0f)
+            target_fps = std::min(target_fps, static_cast<double>(g_presenter_refresh_hz));
+        target_fps = std::max(1.0, target_fps);
+        g_presenter_target_fps.store(static_cast<float>(target_fps), std::memory_order_relaxed);
+        return 1.0 / target_fps;
+    }
+
+    void presenter_wait_slot(double interval)
+    {
+        if (!g_settings.presenter_self_pacing)
+            return;
+        const double now = fg::now_seconds();
+        if (g_presenter_next_slot <= 0.0 ||
+            g_presenter_next_slot < now - interval * 2.0 ||
+            g_presenter_next_slot > now + interval * 4.0)
+            g_presenter_next_slot = now;
+        fg::wait_until(g_presenter_next_slot, std::max(0.002, interval * 2.0));
+        g_presenter_next_slot += interval;
     }
 
     void presenter_thread_main()
@@ -764,11 +833,21 @@ namespace fgx
 
             PresenterSlot &slot = g_presenter_slots[idx];
             // Window ownership/positioning stays on the game's callback thread. The presenter
-            // worker only touches DXGI and the queued textures, reducing cross-thread HWND work.
+            // worker only touches DXGI and the queued textures. Unlike the legacy backend, waits
+            // happen here, never inside the game's reshade_present callback.
             if (!g_reshade_overlay_open && g_presenter_hwnd && IsWindowVisible(g_presenter_hwnd)) {
-                if (!slot.warmup_only)
+                const double out_interval = presenter_output_interval();
+                if (slot.warmup_only) {
+                    presenter_copy_and_present(slot.real, false);
+                    // The next packet arrives roughly one native frame later. Start its midpoint
+                    // slot there so steady state becomes GEN, +dt/2 REAL, +dt/2 GEN ...
+                    g_presenter_next_slot = fg::now_seconds() + std::max(out_interval, g_presenter_native_interval.load(std::memory_order_relaxed));
+                } else {
+                    presenter_wait_slot(out_interval);
                     presenter_copy_and_present(slot.generated, true);
-                presenter_copy_and_present(slot.real, false);
+                    presenter_wait_slot(out_interval);
+                    presenter_copy_and_present(slot.real, false);
+                }
             }
 
             {
@@ -868,7 +947,7 @@ namespace fgx
         // This path purposely does not call the original extra-Present logic. It reuses all of the
         // original capture/flow/interpolation resources, but queues output into the independent
         // presenter instead of consuming the game's swapchain slots.
-        if (fg::g_inside_extra_present)
+        if (fg::g_inside_extra_present || g_inside_presenter_present)
             return;
         const unsigned long long frame_index = fg::g_real_frames.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!fg::g_settings.enabled) {
@@ -901,12 +980,15 @@ namespace fgx
             return;
         presenter_sync_window();
 
-        if (fg::g_settings.aa)
+        // Legacy AA/temporal reconstruction are useful quality options, but they are additional
+        // full-screen work on every REAL game frame. In True Additive they are isolated by default
+        // so a user testing RenoDX/NR does not unknowingly stack another heavy real-frame pass.
+        if (g_settings.reuse_legacy_postprocess && fg::g_settings.aa)
             fg::apply_aa(bb);
         fg::g_ctx->CopyResource(fg::g_curr_tex, bb);
 
         bool flow_ready = false;
-        if (fg::g_settings.accumulate && fg::g_have_prev && fg::g_settings.debug_mode == 0) {
+        if (g_settings.reuse_legacy_postprocess && fg::g_settings.accumulate && fg::g_have_prev && fg::g_settings.debug_mode == 0) {
             fg::apply_accumulator(bb);
             fg::g_ctx->CopyResource(fg::g_curr_tex, bb);
             flow_ready = true;
@@ -919,6 +1001,10 @@ namespace fgx
                 fg::g_dt_ema = (fg::g_dt_ema > 0.0) ? (fg::g_dt_ema * 0.9 + native * 0.1) : native;
         }
         fg::g_prev_cb_entry = cb_entry;
+        if (fg::g_dt_ema > 0.0001 && fg::g_dt_ema < 0.5) {
+            g_presenter_native_interval.store(fg::g_dt_ema, std::memory_order_relaxed);
+            g_presenter_game_fps.store(static_cast<float>(1.0 / fg::g_dt_ema), std::memory_order_relaxed);
+        }
         fg::g_last_wait_total = 0.0;
         fg::g_paced_ms = 0.0;
 
@@ -1075,17 +1161,34 @@ namespace fgx
         if (ImGui::Combo("Output backend", &g_settings.output_mode, output_items, 3)) {
             if (old_output_mode == 2 && g_settings.output_mode != 2)
                 presenter_stop();
+            if (old_output_mode != 2 && g_settings.output_mode == 2) {
+                // Do not inherit the legacy pacer's free-running clock or interval history.
+                fg::g_slot = 0.0;
+                fg::g_last_wait_total = 0.0;
+                fg::g_paced_ms = 0.0;
+                fg::g_last_present_ts = 0.0;
+                g_presenter_next_slot = 0.0;
+            }
         }
         if (g_settings.output_mode == 2) {
-            ImGui::Checkbox("Presenter VSync (recommended)", &g_settings.presenter_vsync);
+            ImGui::Checkbox("Self-pace generated output", &g_settings.presenter_self_pacing);
+            ImGui::Checkbox("Allow tearing for Present(0) when supported", &g_settings.presenter_allow_tearing);
+            ImGui::Checkbox("Reuse legacy AA / temporal reconstruction", &g_settings.reuse_legacy_postprocess);
             ImGui::Checkbox("Hide presenter when game is unfocused", &g_settings.presenter_hide_unfocused);
-            ImGui::TextDisabled("Game Present is left untouched. Generated + real frames are shown on a separate owned swapchain.");
-            ImGui::TextDisabled("First test implementation: DX11 + windowed/borderless + x2 only. Exclusive fullscreen is unsupported; HDR is experimental.");
-            ImGui::TextDisabled("FrameGen Preview's Extra Present / Pace options are ignored by this backend.");
+            ImGui::TextDisabled("True Additive hard-bypasses legacy Extra Present / Pace / injected-vblank controls.");
+            ImGui::TextDisabled("The presenter uses Present(0); timing waits live only on its worker thread, never the game thread.");
+            ImGui::TextDisabled("Secondary presenter ReShade effects are disabled to avoid running RenoDX/NR twice.");
+            ImGui::TextDisabled("DX11 + windowed/borderless + x2 only. Exclusive fullscreen is unsupported; HDR is experimental.");
             ImGui::Text("Presenter: %s", g_presenter_status);
-            ImGui::Text("Presenter output: %.1f FPS", g_presenter_output_fps.load(std::memory_order_relaxed));
+            ImGui::Text("Game real: %.1f FPS | target output: %.1f FPS | actual output: %.1f FPS",
+                g_presenter_game_fps.load(std::memory_order_relaxed),
+                g_presenter_target_fps.load(std::memory_order_relaxed),
+                g_presenter_output_fps.load(std::memory_order_relaxed));
+            ImGui::Text("Display refresh: %.1f Hz | tearing: %s", g_presenter_refresh_hz, g_presenter_tearing_supported ? "supported" : "unavailable");
             ImGui::Text("Presenter real/gen: %llu / %llu | dropped packets: %llu",
                 g_presenter_real_presents.load(), g_presenter_generated_presents.load(), g_presenter_dropped_packets.load());
+            if (fg::g_settings.extra_present || fg::g_settings.pace || fg::g_settings.present_sync != 0)
+                ImGui::TextDisabled("Legacy output switches are currently ON in FrameGen Preview, but are suspended in this backend.");
             if (fg::g_settings.multiplier != 2)
                 ImGui::TextDisabled("Multiplier is forced conceptually to x2 in this presenter test build.");
         } else if (g_settings.output_mode == 1) {
@@ -1120,6 +1223,7 @@ namespace fgx
     void shutdown()
     {
         presenter_stop();
+        g_presenter_effect_runtime = nullptr;
         release_external_view(true);
         release_extension_pipeline();
     }
@@ -1132,16 +1236,38 @@ namespace fgx
         return false;
     }
 
+    void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
+    {
+        if (!runtime)
+            return;
+        const HWND hwnd = reinterpret_cast<HWND>(runtime->get_hwnd());
+        if (g_presenter_hwnd && hwnd == g_presenter_hwnd) {
+            // The presenter's own swapchain may be seen by ReShade as a second runtime. Never run
+            // the user's effects (especially RenoDX/DLSS NR) on it a second time. The queued real
+            // and generated textures already contain the desired game-side effect result.
+            g_presenter_effect_runtime = runtime;
+            runtime->set_effects_state(false);
+        }
+    }
+
     void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
     {
-        // Tear the worker down while ReShade/runtime code is still fully alive rather than waiting
-        // for DLL_PROCESS_DETACH. This also handles games recreating their effect runtime/swapchain.
+        if (runtime == g_presenter_effect_runtime) {
+            g_presenter_effect_runtime = nullptr;
+            return;
+        }
+        // Tear the worker down while the primary game runtime is still alive.
         if (!runtime || !g_presenter_game_hwnd || reinterpret_cast<HWND>(runtime->get_hwnd()) == g_presenter_game_hwnd)
             presenter_stop();
     }
 
     void on_present(reshade::api::effect_runtime *runtime)
     {
+        if (!runtime || g_inside_presenter_present)
+            return;
+        const HWND hwnd = reinterpret_cast<HWND>(runtime->get_hwnd());
+        if (g_presenter_hwnd && hwnd == g_presenter_hwnd)
+            return;
         run(runtime);
     }
 }
@@ -1160,6 +1286,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved)
         reshade::unregister_event<reshade::addon_event::reshade_present>(&on_reshade_present);
         reshade::register_event<reshade::addon_event::reshade_present>(&fgx::on_present);
         reshade::register_event<reshade::addon_event::reshade_open_overlay>(&fgx::on_reshade_open_overlay);
+        reshade::register_event<reshade::addon_event::init_effect_runtime>(&fgx::on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(&fgx::on_destroy_effect_runtime);
         reshade::register_overlay("Hybrid Motion + Output", &fgx::draw_overlay);
         break;
@@ -1167,6 +1294,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved)
     case DLL_PROCESS_DETACH:
         reshade::unregister_event<reshade::addon_event::reshade_present>(&fgx::on_present);
         reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(&fgx::on_reshade_open_overlay);
+        reshade::unregister_event<reshade::addon_event::init_effect_runtime>(&fgx::on_init_effect_runtime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(&fgx::on_destroy_effect_runtime);
         fgx::shutdown();
         // Original cleanup owns the rest of the pipeline/events/add-on registration.
