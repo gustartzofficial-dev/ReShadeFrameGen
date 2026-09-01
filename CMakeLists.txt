@@ -39,7 +39,7 @@ if(NOT streamline_sdk_POPULATED)
     FetchContent_Populate(streamline_sdk)
 endif()
 
-add_library(ReShadeFrameGen SHARED
+add_library(ReShadeFrameGen MODULE
     src/addon.cpp
     src/dependency_probe.cpp
     src/feeder_probe.cpp
@@ -66,22 +66,19 @@ endif()
 
 target_link_libraries(ReShadeFrameGen PRIVATE user32)
 
-# ReShade add-ons are PE DLL binaries. Keep the compiler/linker output as a
-# normal DLL for maximum MSVC/CMake compatibility, then publish a loader-facing
-# .addon64 copy in a deterministic directory.
+# Emit the actual ReShade loader-facing file directly. No intermediate release DLL is packaged.
 set_target_properties(ReShadeFrameGen PROPERTIES
     PREFIX ""
     OUTPUT_NAME "ReShadeFrameGen"
+    SUFFIX ".addon64"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/addon"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/addon"
 )
 
-set(RESH_FRAMEGEN_ADDON_DIR "${CMAKE_BINARY_DIR}/addon")
-set(RESH_FRAMEGEN_ADDON_FILE "${RESH_FRAMEGEN_ADDON_DIR}/ReShadeFrameGen.addon64")
-
-add_custom_command(TARGET ReShadeFrameGen POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${RESH_FRAMEGEN_ADDON_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:ReShadeFrameGen>"
-            "${RESH_FRAMEGEN_ADDON_FILE}"
-    COMMENT "Publishing ReShade add-on: ${RESH_FRAMEGEN_ADDON_FILE}"
-    VERBATIM
-)
+foreach(cfg Debug Release RelWithDebInfo MinSizeRel)
+    string(TOUPPER "${cfg}" CFG_UPPER)
+    set_target_properties(ReShadeFrameGen PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY_${CFG_UPPER} "${CMAKE_BINARY_DIR}/addon/${cfg}"
+        LIBRARY_OUTPUT_DIRECTORY_${CFG_UPPER} "${CMAKE_BINARY_DIR}/addon/${cfg}"
+    )
+endforeach()
