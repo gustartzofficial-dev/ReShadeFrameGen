@@ -19,15 +19,51 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      - name: Package addon
+      - name: Package ReShade addon
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force artifacts
-          Get-ChildItem -Path build -Recurse -Filter "*.addon" | Copy-Item -Destination artifacts -Force
-          Get-ChildItem -Path build -Recurse -Filter "*.dll" | Copy-Item -Destination artifacts -Force
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+
+          # First look for the correct native ReShade addon output.
+          $addon = Get-ChildItem -Path build -Recurse -File -Filter "ReShadeFrameGen.addon64" |
+            Select-Object -First 1
+
+          if ($addon) {
+            Copy-Item $addon.FullName "artifacts/ReShadeFrameGen.addon64" -Force
+            Write-Host "Found native addon64 output:"
+            Write-Host $addon.FullName
+          }
+          else {
+            # Compatibility fallback:
+            # A ReShade addon is a DLL internally, so if CMake/MSVC still emits
+            # ReShadeFrameGen.dll, publish that binary with the .addon64 extension.
+            $dll = Get-ChildItem -Path build -Recurse -File -Filter "ReShadeFrameGen.dll" |
+              Select-Object -First 1
+
+            if (-not $dll) {
+              Write-Error "Build produced neither ReShadeFrameGen.addon64 nor ReShadeFrameGen.dll"
+              exit 1
+            }
+
+            Copy-Item $dll.FullName "artifacts/ReShadeFrameGen.addon64" -Force
+
+            Write-Host "CMake emitted a DLL; converted release artifact to:"
+            Write-Host "artifacts/ReShadeFrameGen.addon64"
+          }
+
+          # Hard validation.
+          if (-not (Test-Path "artifacts/ReShadeFrameGen.addon64")) {
+            Write-Error "ReShadeFrameGen.addon64 was not produced."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "Final artifact:"
+          Get-ChildItem artifacts
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ReShadeFrameGen-addon
-          path: artifacts/*
+          name: ReShadeFrameGen-addon64
+          path: artifacts/ReShadeFrameGen.addon64
+          if-no-files-found: error
