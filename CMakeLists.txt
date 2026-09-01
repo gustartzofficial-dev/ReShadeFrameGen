@@ -1,16 +1,25 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.24)
 
-project(ReShadeDX11FrameGenAddon LANGUAGES CXX)
+project(ReShadeFrameGen LANGUAGES CXX)
+
+if(NOT WIN32)
+    message(FATAL_ERROR "ReShadeFrameGen DLSS-G Host is Windows-only.")
+endif()
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "This first DLSS-G host build is 64-bit only.")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ReShade SDK/header dependency. Keep the existing SDK pin for compatibility.
 include(FetchContent)
+
+# DLSS5-Feeder and the current RenoDX DLSS work target ReShade 6.8+.
 FetchContent_Declare(
     reshade_sdk
     GIT_REPOSITORY https://github.com/crosire/reshade.git
-    GIT_TAG v6.7.3
+    GIT_TAG v6.8.0
     GIT_SHALLOW TRUE
 )
 FetchContent_GetProperties(reshade_sdk)
@@ -18,37 +27,50 @@ if(NOT reshade_sdk_POPULATED)
     FetchContent_Populate(reshade_sdk)
 endif()
 
-# The hybrid/Frankenstein wrapper includes the repository's existing
-# src/reshade_dx11_framegen.cpp directly. Compile ONLY this wrapper to avoid
-# duplicate definitions while preserving the old implementation as fallback.
-add_library(ReShadeDX11FrameGen SHARED
-    src/reshade_dx11_framegen_hybrid.cpp
+# Headers only. No NVIDIA binaries are redistributed by this repository.
+FetchContent_Declare(
+    streamline_sdk
+    GIT_REPOSITORY https://github.com/NVIDIA-RTX/Streamline.git
+    GIT_TAG v2.12.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_GetProperties(streamline_sdk)
+if(NOT streamline_sdk_POPULATED)
+    FetchContent_Populate(streamline_sdk)
+endif()
+
+add_library(ReShadeFrameGen SHARED
+    src/addon.cpp
+    src/dependency_probe.cpp
+    src/feeder_probe.cpp
+    src/streamline_host.cpp
 )
 
-target_include_directories(ReShadeDX11FrameGen PRIVATE
+target_include_directories(ReShadeFrameGen PRIVATE
     ${reshade_sdk_SOURCE_DIR}/include
     ${reshade_sdk_SOURCE_DIR}/deps/imgui
+    ${streamline_sdk_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-target_compile_definitions(ReShadeDX11FrameGen PRIVATE
+target_compile_definitions(ReShadeFrameGen PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
+    UNICODE
+    _UNICODE
 )
 
-target_link_libraries(ReShadeDX11FrameGen PRIVATE
-    d3d11
-    dxgi
-    d3dcompiler
-    user32
-    dwmapi
-)
+if(MSVC)
+    target_compile_options(ReShadeFrameGen PRIVATE /W4 /permissive- /EHsc)
+endif()
 
-# Emit the PE DLL directly with ReShade's add-on extension. This avoids producing
-# a second runtime .dll that looks like a dependency but is actually the same binary.
-set_target_properties(ReShadeDX11FrameGen PROPERTIES
+target_link_libraries(ReShadeFrameGen PRIVATE user32)
+
+# Emit one ReShade add-on file, not a confusing .dll + copied .addon pair.
+set_target_properties(ReShadeFrameGen PROPERTIES
     PREFIX ""
-    SUFFIX ".addon"
-    OUTPUT_NAME "ReShadeDX11FrameGen"
+    SUFFIX ".addon64"
+    OUTPUT_NAME "ReShadeFrameGen"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/addon"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/addon"
 )
