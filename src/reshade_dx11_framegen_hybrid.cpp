@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <deque>
 #include <chrono>
+#include <atomic>
 
 namespace fgx
 {
@@ -395,39 +396,57 @@ namespace fgx
     void run_original_with_output_mode(reshade::api::effect_runtime *runtime);
 
     // --------------------------------------------------------------------------------------
-    // Independent additive presenter
+    // Independent additive presenter - V3 stability architecture
     //
-    // Why this exists: Present() calls injected into the game's own swapchain necessarily share
-    // the game's backbuffer cadence. Spacing those presents stalls the game thread; not spacing
-    // them makes generated + real frames land back-to-back. DLSS-G/FSR solve this with a proxy
-    // presentation path. ReShade add-ons cannot replace ReShade's DXGI proxy after the game has
-    // already created it, so this experimental DX11 path uses a second, click-through owned
-    // presentation window/swapchain. The game keeps its own Present cadence untouched underneath;
-    // this presenter displays captured real + generated frames at the monitor cadence above it.
+    // IMPORTANT: the game D3D11 immediate context is NEVER touched from the presenter thread.
+    // The game thread renders/copies into shared keyed-mutex textures. The presenter thread owns
+    // a completely separate D3D11 device + immediate context + DXGI swapchain + HWND, opens those
+    // shared textures on the same adapter, and performs all output CopyResource/Present calls.
     //
-    // It is intentionally x2-only for the first test build. This keeps the queue bounded and makes
-    // the expected behavior unambiguous: 60 real -> ~120 presented on a >=120 Hz display, 30 -> ~60.
+    // This matters for ReShade/Home-menu transitions: hiding the overlay is the first moment the
+    // presenter becomes visible and begins presenting. V2 shared the game's immediate context on
+    // this worker, which violates D3D11/DXGI threading guidance and could deadlock exactly then.
     // --------------------------------------------------------------------------------------
     struct PresenterSlot
     {
+        // Game-device side. The interpolation shader writes here on the normal game/ReShade thread.
         ID3D11Texture2D *generated = nullptr;
         ID3D11Texture2D *real = nullptr;
+        IDXGIKeyedMutex *generated_game_mutex = nullptr;
+        IDXGIKeyedMutex *real_game_mutex = nullptr;
+        HANDLE generated_shared = nullptr; // legacy DXGI shared handle; do not CloseHandle
+        HANDLE real_shared = nullptr;
+
+        // Presenter-device side. Opened from the shared handles and touched only by worker thread.
+        ID3D11Texture2D *generated_present = nullptr;
+        ID3D11Texture2D *real_present = nullptr;
+        IDXGIKeyedMutex *generated_present_mutex = nullptr;
+        IDXGIKeyedMutex *real_present_mutex = nullptr;
+
         bool ready = false;
         bool in_use = false;
         bool warmup_only = false;
+        bool generated_ready = false;
+        bool real_ready = false;
         unsigned long long serial = 0;
     };
 
     HINSTANCE g_module_instance = nullptr;
     HWND g_presenter_game_hwnd = nullptr;
-    HWND g_presenter_hwnd = nullptr;
+    std::atomic<HWND> g_presenter_hwnd{nullptr};
+
+    // The game device is borrowed only as an identity for rebuild detection and creating the
+    // shared producer textures. It is never used by the worker.
+    ID3D11Device *g_presenter_device = nullptr;
+    IDXGIAdapter *g_presenter_adapter = nullptr; // AddRef'd until worker stops
+
+    // Owned exclusively by presenter thread after creation.
+    ID3D11Device *g_present_device = nullptr;
+    ID3D11DeviceContext *g_present_ctx = nullptr;
     IDXGISwapChain1 *g_presenter_swap = nullptr;
     IDXGISwapChain3 *g_presenter_swap3 = nullptr;
-    ID3D11Device *g_presenter_device = nullptr; // borrowed identity; detects device recreation
-    ID3D11Multithread *g_presenter_mt = nullptr;
-    BOOL g_presenter_prev_mt = FALSE;
-    HANDLE g_presenter_latency_waitable = nullptr; // kept for ABI/state cleanup; V2 does not use it for pacing
-    reshade::api::effect_runtime *g_presenter_effect_runtime = nullptr; // borrowed; secondary ReShade runtime if one is created
+
+    reshade::api::effect_runtime *g_presenter_effect_runtime = nullptr; // borrowed secondary runtime
     thread_local bool g_inside_presenter_present = false;
     std::thread g_presenter_thread;
     std::mutex g_presenter_mutex;
@@ -436,27 +455,34 @@ namespace fgx
     std::deque<int> g_presenter_ready;
     bool g_presenter_stop = false;
     bool g_presenter_running = false;
-    bool g_reshade_overlay_open = false;
+    std::atomic<bool> g_presenter_worker_ready{false};
+    std::atomic<bool> g_presenter_worker_failed{false};
+    std::atomic<bool> g_reshade_overlay_open{false};
+    std::atomic<bool> g_presenter_force_hide{true};
     UINT g_presenter_width = 0, g_presenter_height = 0;
     DXGI_FORMAT g_presenter_format = DXGI_FORMAT_UNKNOWN;
     std::atomic<unsigned long long> g_presenter_real_presents{0};
     std::atomic<unsigned long long> g_presenter_generated_presents{0};
     std::atomic<unsigned long long> g_presenter_dropped_packets{0};
+    std::atomic<unsigned long long> g_presenter_sync_misses{0};
     std::atomic<float> g_presenter_output_fps{0.0f};
     std::atomic<float> g_presenter_game_fps{0.0f};
     std::atomic<float> g_presenter_target_fps{0.0f};
     std::atomic<double> g_presenter_native_interval{1.0 / 60.0};
     double g_presenter_last_present_time = 0.0; // presenter thread only
-    double g_presenter_next_slot = 0.0;          // presenter thread only
-    float g_presenter_refresh_hz = 0.0f;
-    bool g_presenter_tearing_supported = false;
-    const char *g_presenter_status = "off";
+    double g_presenter_next_slot = 0.0;         // presenter thread only
+    std::atomic<float> g_presenter_refresh_hz{0.0f};
+    std::atomic<bool> g_presenter_tearing_supported{false};
+    std::atomic<bool> g_presenter_self_pacing_runtime{true};
+    std::atomic<bool> g_presenter_hide_unfocused_runtime{true};
+    std::atomic<bool> g_presenter_swap_tearing_enabled{false};
+    std::atomic<const char *> g_presenter_status{"off"};
 
     LRESULT CALLBACK presenter_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         switch (msg) {
         case WM_NCHITTEST:
-            return HTTRANSPARENT; // never steal mouse input from the game
+            return HTTRANSPARENT;
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
         case WM_ERASEBKGND:
@@ -480,47 +506,27 @@ namespace fgx
         }
     }
 
-    void presenter_release_slot(PresenterSlot &s)
+    void presenter_release_slot_game(PresenterSlot &s)
     {
         presenter_forget_cached_rtv(s.generated);
         presenter_forget_cached_rtv(s.real);
+        release(s.generated_game_mutex);
+        release(s.real_game_mutex);
         release(s.generated);
         release(s.real);
+        s.generated_shared = nullptr;
+        s.real_shared = nullptr;
         s.ready = s.in_use = s.warmup_only = false;
+        s.generated_ready = s.real_ready = false;
         s.serial = 0;
     }
 
-    void presenter_release_resources()
+    void presenter_release_slot_worker(PresenterSlot &s)
     {
-        for (auto &s : g_presenter_slots)
-            presenter_release_slot(s);
-        g_presenter_ready.clear();
-        release(g_presenter_swap3);
-        release(g_presenter_swap);
-        g_presenter_device = nullptr;
-        g_presenter_latency_waitable = nullptr;
-        g_presenter_width = g_presenter_height = 0;
-        g_presenter_format = DXGI_FORMAT_UNKNOWN;
-        g_presenter_last_present_time = 0.0;
-        g_presenter_next_slot = 0.0;
-        g_presenter_output_fps.store(0.0f, std::memory_order_relaxed);
-        g_presenter_target_fps.store(0.0f, std::memory_order_relaxed);
-        g_presenter_tearing_supported = false;
-    }
-
-    void presenter_hide_window()
-    {
-        if (g_presenter_hwnd)
-            ShowWindow(g_presenter_hwnd, SW_HIDE);
-    }
-
-    void presenter_destroy_window()
-    {
-        if (g_presenter_hwnd) {
-            DestroyWindow(g_presenter_hwnd);
-            g_presenter_hwnd = nullptr;
-        }
-        g_presenter_game_hwnd = nullptr;
+        release(s.generated_present_mutex);
+        release(s.real_present_mutex);
+        release(s.generated_present);
+        release(s.real_present);
     }
 
     bool presenter_supported_format(DXGI_FORMAT f)
@@ -534,71 +540,6 @@ namespace fgx
         default:
             return false;
         }
-    }
-
-    bool presenter_create_window(HWND game_hwnd)
-    {
-        if (!game_hwnd)
-            return false;
-        if (g_presenter_hwnd && g_presenter_game_hwnd == game_hwnd)
-            return true;
-
-        presenter_destroy_window();
-
-        static const wchar_t *klass = L"ReShadeFrameGenIndependentPresenter";
-        static bool class_registered = false;
-        if (!class_registered) {
-            WNDCLASSEXW wc{};
-            wc.cbSize = sizeof(wc);
-            wc.lpfnWndProc = presenter_wndproc;
-            wc.hInstance = g_module_instance ? g_module_instance : GetModuleHandleW(nullptr);
-            wc.lpszClassName = klass;
-            wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-            class_registered = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
-        }
-        if (!class_registered)
-            return false;
-
-        // WS_POPUP with game_hwnd as owner keeps this surface above the game without making it
-        // system-topmost. NOACTIVATE + HTTRANSPARENT keep keyboard/mouse focus on the game.
-        g_presenter_hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            klass, L"ReShade FrameGen Presenter", WS_POPUP,
-            0, 0, 16, 16, game_hwnd, nullptr,
-            g_module_instance ? g_module_instance : GetModuleHandleW(nullptr), nullptr);
-        if (!g_presenter_hwnd)
-            return false;
-        g_presenter_game_hwnd = game_hwnd;
-        return true;
-    }
-
-    bool presenter_sync_window()
-    {
-        if (!g_presenter_hwnd || !g_presenter_game_hwnd)
-            return false;
-
-        bool focused = true;
-        if (g_settings.presenter_hide_unfocused) {
-            HWND fgwin = GetForegroundWindow();
-            focused = fgwin == g_presenter_game_hwnd || fgwin == g_presenter_hwnd ||
-                      IsChild(g_presenter_game_hwnd, fgwin) || IsChild(fgwin, g_presenter_game_hwnd);
-        }
-        if (g_reshade_overlay_open || IsIconic(g_presenter_game_hwnd) || !IsWindowVisible(g_presenter_game_hwnd) || !focused) {
-            presenter_hide_window();
-            return false;
-        }
-
-        RECT r{};
-        if (!GetClientRect(g_presenter_game_hwnd, &r))
-            return false;
-        POINT p{0, 0};
-        if (!ClientToScreen(g_presenter_game_hwnd, &p))
-            return false;
-        int w = std::max(1L, r.right - r.left);
-        int h = std::max(1L, r.bottom - r.top);
-        SetWindowPos(g_presenter_hwnd, HWND_TOP, p.x, p.y, w, h,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
-        return true;
     }
 
     float presenter_query_refresh_hz(HWND hwnd)
@@ -615,8 +556,17 @@ namespace fgx
         return static_cast<float>(dm.dmDisplayFrequency);
     }
 
-    bool presenter_make_texture(UINT w, UINT h, DXGI_FORMAT fmt, ID3D11Texture2D **out)
+    bool presenter_make_shared_texture(UINT w, UINT h, DXGI_FORMAT fmt,
+                                       ID3D11Texture2D **out_tex,
+                                       IDXGIKeyedMutex **out_mutex,
+                                       HANDLE *out_handle)
     {
+        if (!fg::g_dev || !out_tex || !out_mutex || !out_handle)
+            return false;
+        *out_tex = nullptr;
+        *out_mutex = nullptr;
+        *out_handle = nullptr;
+
         D3D11_TEXTURE2D_DESC d{};
         d.Width = w; d.Height = h;
         d.MipLevels = 1; d.ArraySize = 1;
@@ -624,43 +574,212 @@ namespace fgx
         d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT;
         d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        HRESULT hr = fg::g_dev->CreateTexture2D(&d, nullptr, out);
-        if (FAILED(hr)) {
+        d.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+        HRESULT hr = fg::g_dev->CreateTexture2D(&d, nullptr, out_tex);
+        if (FAILED(hr) || !*out_tex) {
             fg::g_last_hr = hr;
+            return false;
+        }
+        hr = (*out_tex)->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(out_mutex));
+        IDXGIResource *res = nullptr;
+        if (SUCCEEDED(hr))
+            hr = (*out_tex)->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&res));
+        if (SUCCEEDED(hr) && res)
+            hr = res->GetSharedHandle(out_handle);
+        release(res);
+        if (FAILED(hr) || !*out_mutex || !*out_handle) {
+            fg::g_last_hr = hr;
+            release(*out_mutex);
+            release(*out_tex);
+            *out_handle = nullptr;
             return false;
         }
         return true;
     }
 
-    bool presenter_create_swapchain_and_slots(HWND game_hwnd, UINT w, UINT h, DXGI_FORMAT fmt)
+    void presenter_release_game_resources()
     {
-        if (!fg::g_dev || !presenter_supported_format(fmt)) {
-            g_presenter_status = "unsupported backbuffer format";
-            return false;
-        }
-        if (!presenter_create_window(game_hwnd)) {
-            g_presenter_status = "presenter window creation failed";
+        for (auto &s : g_presenter_slots)
+            presenter_release_slot_game(s);
+        g_presenter_ready.clear();
+        release(g_presenter_adapter);
+        g_presenter_device = nullptr;
+        g_presenter_game_hwnd = nullptr;
+        g_presenter_width = g_presenter_height = 0;
+        g_presenter_format = DXGI_FORMAT_UNKNOWN;
+        g_presenter_output_fps.store(0.0f, std::memory_order_relaxed);
+        g_presenter_target_fps.store(0.0f, std::memory_order_relaxed);
+        g_presenter_refresh_hz.store(0.0f, std::memory_order_relaxed);
+        g_presenter_tearing_supported.store(false, std::memory_order_relaxed);
+        g_presenter_swap_tearing_enabled.store(false, std::memory_order_relaxed);
+        g_presenter_last_present_time = 0.0;
+        g_presenter_next_slot = 0.0;
+    }
+
+    bool presenter_prepare_game_resources(HWND game_hwnd, UINT w, UINT h, DXGI_FORMAT fmt)
+    {
+        if (!fg::g_dev || !game_hwnd || !presenter_supported_format(fmt)) {
+            g_presenter_status.store("unsupported game backbuffer", std::memory_order_relaxed);
             return false;
         }
 
-        presenter_release_resources();
+        IDXGIDevice *dxgi_dev = nullptr;
+        IDXGIAdapter *adapter = nullptr;
+        HRESULT hr = fg::g_dev->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_dev));
+        if (SUCCEEDED(hr) && dxgi_dev)
+            hr = dxgi_dev->GetAdapter(&adapter);
+        release(dxgi_dev);
+        if (FAILED(hr) || !adapter) {
+            release(adapter);
+            g_presenter_status.store("game DXGI adapter unavailable", std::memory_order_relaxed);
+            return false;
+        }
+
+        g_presenter_adapter = adapter; // ownership transferred
+        for (auto &slot : g_presenter_slots) {
+            if (!presenter_make_shared_texture(w, h, fmt, &slot.generated, &slot.generated_game_mutex, &slot.generated_shared) ||
+                !presenter_make_shared_texture(w, h, fmt, &slot.real, &slot.real_game_mutex, &slot.real_shared)) {
+                g_presenter_status.store("shared keyed texture creation failed", std::memory_order_relaxed);
+                presenter_release_game_resources();
+                return false;
+            }
+        }
+
+        g_presenter_device = fg::g_dev;
+        g_presenter_game_hwnd = game_hwnd;
+        g_presenter_width = w;
+        g_presenter_height = h;
+        g_presenter_format = fmt;
+        g_presenter_refresh_hz.store(presenter_query_refresh_hz(game_hwnd), std::memory_order_relaxed);
+        g_presenter_status.store("shared resources ready; starting presenter thread", std::memory_order_relaxed);
+        return true;
+    }
+
+    bool presenter_worker_create_window()
+    {
+        if (!g_presenter_game_hwnd)
+            return false;
+
+        static const wchar_t *klass = L"ReShadeFrameGenIndependentPresenterV3";
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = presenter_wndproc;
+        wc.hInstance = g_module_instance ? g_module_instance : GetModuleHandleW(nullptr);
+        wc.lpszClassName = klass;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            return false;
+
+        HWND hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            klass, L"ReShade FrameGen Presenter", WS_POPUP,
+            0, 0, 16, 16, g_presenter_game_hwnd, nullptr,
+            g_module_instance ? g_module_instance : GetModuleHandleW(nullptr), nullptr);
+        if (!hwnd)
+            return false;
+        g_presenter_hwnd.store(hwnd, std::memory_order_release);
+        return true;
+    }
+
+    void presenter_worker_pump_messages()
+    {
+        MSG msg{};
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    bool presenter_worker_sync_window()
+    {
+        HWND hwnd = g_presenter_hwnd.load(std::memory_order_acquire);
+        HWND game = g_presenter_game_hwnd;
+        if (!hwnd || !game)
+            return false;
+
+        bool focused = true;
+        if (g_presenter_hide_unfocused_runtime.load(std::memory_order_relaxed)) {
+            HWND fgwin = GetForegroundWindow();
+            focused = fgwin == game || fgwin == hwnd || IsChild(game, fgwin) || IsChild(fgwin, game);
+        }
+        const bool hidden = g_reshade_overlay_open.load(std::memory_order_relaxed) ||
+                            g_presenter_force_hide.load(std::memory_order_relaxed) ||
+                            IsIconic(game) || !IsWindowVisible(game) || !focused;
+        if (hidden) {
+            ShowWindow(hwnd, SW_HIDE);
+            return false;
+        }
+
+        RECT r{};
+        POINT p{0, 0};
+        if (!GetClientRect(game, &r) || !ClientToScreen(game, &p)) {
+            ShowWindow(hwnd, SW_HIDE);
+            return false;
+        }
+        int w = std::max(1L, r.right - r.left);
+        int h = std::max(1L, r.bottom - r.top);
+        SetWindowPos(hwnd, HWND_TOP, p.x, p.y, w, h,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+        return true;
+    }
+
+    bool presenter_worker_open_shared(PresenterSlot &slot)
+    {
+        if (!g_present_device || !slot.generated_shared || !slot.real_shared)
+            return false;
+        HRESULT hr = g_present_device->OpenSharedResource(slot.generated_shared, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&slot.generated_present));
+        if (SUCCEEDED(hr) && slot.generated_present)
+            hr = slot.generated_present->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&slot.generated_present_mutex));
+        if (SUCCEEDED(hr))
+            hr = g_present_device->OpenSharedResource(slot.real_shared, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&slot.real_present));
+        if (SUCCEEDED(hr) && slot.real_present)
+            hr = slot.real_present->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&slot.real_present_mutex));
+        return SUCCEEDED(hr) && slot.generated_present_mutex && slot.real_present_mutex;
+    }
+
+    bool presenter_worker_init()
+    {
+        if (!g_presenter_adapter || !presenter_worker_create_window()) {
+            g_presenter_status.store("presenter worker window/adapter init failed", std::memory_order_relaxed);
+            return false;
+        }
+
+        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        D3D_FEATURE_LEVEL fl{};
+        const D3D_FEATURE_LEVEL levels[] = {
+            D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0
+        };
+        HRESULT hr = D3D11CreateDevice(g_presenter_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
+                                       levels, static_cast<UINT>(sizeof(levels) / sizeof(levels[0])), D3D11_SDK_VERSION,
+                                       &g_present_device, &fl, &g_present_ctx);
+        if (hr == E_INVALIDARG) {
+            hr = D3D11CreateDevice(g_presenter_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
+                                   levels + 1, static_cast<UINT>((sizeof(levels) / sizeof(levels[0])) - 1), D3D11_SDK_VERSION,
+                                   &g_present_device, &fl, &g_present_ctx);
+        }
+        if (FAILED(hr) || !g_present_device || !g_present_ctx) {
+            g_presenter_status.store("separate presenter D3D11 device creation failed", std::memory_order_relaxed);
+            return false;
+        }
 
         IDXGIDevice *dxgi_dev = nullptr;
         IDXGIAdapter *adapter = nullptr;
         IDXGIFactory2 *factory = nullptr;
-        HRESULT hr = fg::g_dev->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_dev));
+        hr = g_present_device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_dev));
         if (SUCCEEDED(hr) && dxgi_dev)
             hr = dxgi_dev->GetAdapter(&adapter);
         if (SUCCEEDED(hr) && adapter)
             hr = adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void **>(&factory));
+        release(dxgi_dev);
+        release(adapter);
         if (FAILED(hr) || !factory) {
-            release(factory); release(adapter); release(dxgi_dev);
-            g_presenter_status = "DXGI factory unavailable";
+            release(factory);
+            g_presenter_status.store("presenter DXGI factory unavailable", std::memory_order_relaxed);
             return false;
         }
 
-        // True Additive must not use Present(1) or the old frame-latency waitable object as its
-        // clock. Detect tearing support and submit Present(0) from our own paced worker instead.
         BOOL allow_tearing = FALSE;
         IDXGIFactory5 *factory5 = nullptr;
         if (SUCCEEDED(factory->QueryInterface(__uuidof(IDXGIFactory5), reinterpret_cast<void **>(&factory5))) && factory5) {
@@ -668,11 +787,14 @@ namespace fgx
                 allow_tearing = FALSE;
             factory5->Release();
         }
-        g_presenter_tearing_supported = allow_tearing == TRUE;
+        g_presenter_tearing_supported.store(allow_tearing == TRUE, std::memory_order_relaxed);
+        const bool swap_tearing = g_settings.presenter_allow_tearing && (allow_tearing == TRUE);
+        g_presenter_swap_tearing_enabled.store(swap_tearing, std::memory_order_relaxed);
 
         DXGI_SWAP_CHAIN_DESC1 sd{};
-        sd.Width = w; sd.Height = h;
-        sd.Format = fmt;
+        sd.Width = g_presenter_width;
+        sd.Height = g_presenter_height;
+        sd.Format = g_presenter_format;
         sd.Stereo = FALSE;
         sd.SampleDesc.Count = 1;
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -680,83 +802,121 @@ namespace fgx
         sd.Scaling = DXGI_SCALING_STRETCH;
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-        sd.Flags = (g_settings.presenter_allow_tearing && g_presenter_tearing_supported) ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u;
+        sd.Flags = g_presenter_swap_tearing_enabled.load(std::memory_order_relaxed) ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u;
 
-        hr = factory->CreateSwapChainForHwnd(fg::g_dev, g_presenter_hwnd, &sd, nullptr, nullptr, &g_presenter_swap);
-        factory->MakeWindowAssociation(g_presenter_hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
-        release(factory); release(adapter); release(dxgi_dev);
+        HWND hwnd = g_presenter_hwnd.load(std::memory_order_acquire);
+        hr = factory->CreateSwapChainForHwnd(g_present_device, hwnd, &sd, nullptr, nullptr, &g_presenter_swap);
+        if (SUCCEEDED(hr))
+            factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+        release(factory);
         if (FAILED(hr) || !g_presenter_swap) {
-            fg::g_last_hr = hr;
-            g_presenter_status = "presenter swapchain creation failed";
-            presenter_release_resources();
+            g_presenter_status.store("separate presenter swapchain creation failed", std::memory_order_relaxed);
             return false;
         }
 
-        // Do not call SetMaximumFrameLatency(1) here: with two output Presents per real frame it
-        // can turn DXGI queue pressure into another hidden throttle. The worker below owns pacing.
-        g_presenter_latency_waitable = nullptr;
         if (SUCCEEDED(g_presenter_swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_presenter_swap3))) && g_presenter_swap3) {
-            // Mirror the obvious color-space choice for common SDR/HDR backbuffer formats.
-            // If the driver rejects it, presentation still continues using the swapchain default.
-            if (fmt == DXGI_FORMAT_R10G10B10A2_UNORM)
+            if (g_presenter_format == DXGI_FORMAT_R10G10B10A2_UNORM)
                 g_presenter_swap3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-            else if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT)
+            else if (g_presenter_format == DXGI_FORMAT_R16G16B16A16_FLOAT)
                 g_presenter_swap3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
             else
                 g_presenter_swap3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
         }
 
         for (auto &slot : g_presenter_slots) {
-            if (!presenter_make_texture(w, h, fmt, &slot.generated) ||
-                !presenter_make_texture(w, h, fmt, &slot.real)) {
-                g_presenter_status = "presenter queue texture creation failed";
-                presenter_release_resources();
+            if (!presenter_worker_open_shared(slot)) {
+                g_presenter_status.store("presenter failed to open shared textures", std::memory_order_relaxed);
                 return false;
             }
         }
 
-        // The game and presenter share the D3D11 immediate context. Ask the runtime to serialize
-        // context calls across both threads. This costs some CPU overhead but avoids racing D3D11
-        // state while the presenter copies to its own swapchain.
-        if (!g_presenter_mt && fg::g_ctx && SUCCEEDED(fg::g_ctx->QueryInterface(__uuidof(ID3D11Multithread), reinterpret_cast<void **>(&g_presenter_mt))) && g_presenter_mt) {
-            g_presenter_prev_mt = g_presenter_mt->GetMultithreadProtected();
-            g_presenter_mt->SetMultithreadProtected(TRUE);
-        }
-
-        g_presenter_device = fg::g_dev;
-        g_presenter_width = w;
-        g_presenter_height = h;
-        g_presenter_format = fmt;
-        g_presenter_refresh_hz = presenter_query_refresh_hz(game_hwnd);
-        g_presenter_status = "ready (legacy Present path isolated)";
-        presenter_sync_window();
+        g_presenter_status.store("ready - separate device/thread", std::memory_order_relaxed);
         return true;
     }
 
-    bool presenter_copy_and_present(ID3D11Texture2D *src, bool generated)
+    void presenter_worker_cleanup()
     {
-        if (!src || !g_presenter_swap || !fg::g_ctx)
+        for (auto &slot : g_presenter_slots)
+            presenter_release_slot_worker(slot);
+        release(g_presenter_swap3);
+        release(g_presenter_swap);
+        release(g_present_ctx);
+        release(g_present_device);
+
+        HWND hwnd = g_presenter_hwnd.exchange(nullptr, std::memory_order_acq_rel);
+        if (hwnd)
+            DestroyWindow(hwnd); // worker owns the HWND and destroys it on the same thread
+    }
+
+    double presenter_output_interval()
+    {
+        double native = g_presenter_native_interval.load(std::memory_order_relaxed);
+        if (!(native > 0.0001 && native < 0.5))
+            native = 1.0 / 60.0;
+        double target_fps = 2.0 / native;
+        const float refresh_hz = g_presenter_refresh_hz.load(std::memory_order_relaxed);
+        if (refresh_hz > 1.0f)
+            target_fps = std::min(target_fps, static_cast<double>(refresh_hz));
+        target_fps = std::max(1.0, target_fps);
+        g_presenter_target_fps.store(static_cast<float>(target_fps), std::memory_order_relaxed);
+        return 1.0 / target_fps;
+    }
+
+    void presenter_wait_slot(double interval)
+    {
+        if (!g_presenter_self_pacing_runtime.load(std::memory_order_relaxed))
+            return;
+        const double now = fg::now_seconds();
+        if (g_presenter_next_slot <= 0.0 ||
+            g_presenter_next_slot < now - interval * 2.0 ||
+            g_presenter_next_slot > now + interval * 4.0)
+            g_presenter_next_slot = now;
+        fg::wait_until(g_presenter_next_slot, std::max(0.002, interval * 2.0));
+        g_presenter_next_slot += interval;
+    }
+
+    bool presenter_worker_acquire(IDXGIKeyedMutex *mutex)
+    {
+        if (!mutex)
             return false;
+        HRESULT hr = mutex->AcquireSync(1u, 100u); // worker may wait; game thread never does
+        if (FAILED(hr)) {
+            g_presenter_sync_misses.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    }
+
+    void presenter_worker_return(IDXGIKeyedMutex *mutex)
+    {
+        if (mutex)
+            mutex->ReleaseSync(0u);
+    }
+
+    bool presenter_copy_and_present(ID3D11Texture2D *src, IDXGIKeyedMutex *mutex, bool generated)
+    {
+        if (!src || !mutex || !g_presenter_swap || !g_present_ctx)
+            return false;
+        if (!presenter_worker_acquire(mutex))
+            return false;
+
         ID3D11Texture2D *bb = nullptr;
         const UINT back_index = g_presenter_swap3 ? g_presenter_swap3->GetCurrentBackBufferIndex() : 0u;
         HRESULT hr = g_presenter_swap->GetBuffer(back_index, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&bb));
-        if (FAILED(hr) || !bb)
+        if (SUCCEEDED(hr) && bb) {
+            g_present_ctx->CopyResource(bb, src);
+            bb->Release();
+        }
+
+        // Release key 0 after the present-device copy has been queued. The keyed mutex orders the
+        // cross-device GPU work, so the game cannot overwrite this texture before our copy is done.
+        presenter_worker_return(mutex);
+        if (FAILED(hr))
             return false;
 
-        fg::g_ctx->CopyResource(bb, src);
-        // Present submits the copy; avoid an explicit Flush here so the presenter thread does not
-        // inject unnecessary command-stream flushes into the game's shared D3D11 device.
-        bb->Release();
-
-        // Never use Present(1) in True Additive. It turns every generated/real submission into a
-        // vblank wait and collapses a 60->120 target back toward 60 once the DXGI queue fills.
-        // Also guard this secondary swapchain from re-entering our ReShade present callback.
-        const UINT present_flags = (g_settings.presenter_allow_tearing && g_presenter_tearing_supported) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+        const UINT present_flags = g_presenter_swap_tearing_enabled.load(std::memory_order_relaxed) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
         g_inside_presenter_present = true;
-        const bool old_inside_extra = fg::g_inside_extra_present;
-        fg::g_inside_extra_present = true;
         hr = g_presenter_swap->Present(0u, present_flags);
-        fg::g_inside_extra_present = old_inside_extra;
         g_inside_presenter_present = false;
         if (SUCCEEDED(hr)) {
             const double t = fg::now_seconds();
@@ -769,7 +929,6 @@ namespace fgx
                 }
             }
             g_presenter_last_present_time = t;
-            fg::record_present();
             if (generated) {
                 g_presenter_generated_presents.fetch_add(1, std::memory_order_relaxed);
                 fg::g_extra_presents.fetch_add(1, std::memory_order_relaxed);
@@ -778,83 +937,95 @@ namespace fgx
             }
             return true;
         }
-        fg::g_last_hr = hr;
         return false;
     }
 
-    double presenter_output_interval()
+    void presenter_worker_discard(PresenterSlot &slot)
     {
-        double native = g_presenter_native_interval.load(std::memory_order_relaxed);
-        if (!(native > 0.0001 && native < 0.5))
-            native = 1.0 / 60.0;
-        double target_fps = 2.0 / native;
-        if (g_presenter_refresh_hz > 1.0f)
-            target_fps = std::min(target_fps, static_cast<double>(g_presenter_refresh_hz));
-        target_fps = std::max(1.0, target_fps);
-        g_presenter_target_fps.store(static_cast<float>(target_fps), std::memory_order_relaxed);
-        return 1.0 / target_fps;
-    }
-
-    void presenter_wait_slot(double interval)
-    {
-        if (!g_settings.presenter_self_pacing)
-            return;
-        const double now = fg::now_seconds();
-        if (g_presenter_next_slot <= 0.0 ||
-            g_presenter_next_slot < now - interval * 2.0 ||
-            g_presenter_next_slot > now + interval * 4.0)
-            g_presenter_next_slot = now;
-        fg::wait_until(g_presenter_next_slot, std::max(0.002, interval * 2.0));
-        g_presenter_next_slot += interval;
+        // Overlay open/unfocused: return shared ownership without ever touching the game's context.
+        if (slot.generated_ready && presenter_worker_acquire(slot.generated_present_mutex))
+            presenter_worker_return(slot.generated_present_mutex);
+        if (slot.real_ready && presenter_worker_acquire(slot.real_present_mutex))
+            presenter_worker_return(slot.real_present_mutex);
     }
 
     void presenter_thread_main()
     {
+        const bool initialized = presenter_worker_init();
+        g_presenter_worker_ready.store(initialized, std::memory_order_release);
+        g_presenter_worker_failed.store(!initialized, std::memory_order_release);
+        if (!initialized) {
+            presenter_worker_cleanup();
+            return;
+        }
+
         for (;;) {
+            presenter_worker_pump_messages();
+            const bool visible = presenter_worker_sync_window();
             int idx = -1;
             {
                 std::unique_lock<std::mutex> lock(g_presenter_mutex);
-                g_presenter_cv.wait(lock, [] { return g_presenter_stop || !g_presenter_ready.empty(); });
+                g_presenter_cv.wait_for(lock, std::chrono::milliseconds(2), [] {
+                    return g_presenter_stop || !g_presenter_ready.empty();
+                });
                 if (g_presenter_stop)
                     break;
-                // Low-latency policy: if producer outran us, keep the newest packet and discard
-                // older ready packets rather than building a long FG queue.
-                while (g_presenter_ready.size() > 1) {
-                    int old = g_presenter_ready.front();
+                if (!g_presenter_ready.empty()) {
+                    idx = g_presenter_ready.front();
                     g_presenter_ready.pop_front();
-                    g_presenter_slots[old].ready = false;
-                    g_presenter_dropped_packets.fetch_add(1, std::memory_order_relaxed);
+                    g_presenter_slots[idx].ready = false;
+                    g_presenter_slots[idx].in_use = true;
                 }
-                idx = g_presenter_ready.front();
-                g_presenter_ready.pop_front();
-                g_presenter_slots[idx].ready = false;
-                g_presenter_slots[idx].in_use = true;
             }
+            if (idx < 0)
+                continue;
 
             PresenterSlot &slot = g_presenter_slots[idx];
-            // Window ownership/positioning stays on the game's callback thread. The presenter
-            // worker only touches DXGI and the queued textures. Unlike the legacy backend, waits
-            // happen here, never inside the game's reshade_present callback.
-            if (!g_reshade_overlay_open && g_presenter_hwnd && IsWindowVisible(g_presenter_hwnd)) {
+            if (!visible) {
+                presenter_worker_discard(slot);
+            } else {
                 const double out_interval = presenter_output_interval();
-                if (slot.warmup_only) {
-                    presenter_copy_and_present(slot.real, false);
-                    // The next packet arrives roughly one native frame later. Start its midpoint
-                    // slot there so steady state becomes GEN, +dt/2 REAL, +dt/2 GEN ...
+                if (slot.warmup_only || !slot.generated_ready) {
+                    if (slot.real_ready)
+                        presenter_copy_and_present(slot.real_present, slot.real_present_mutex, false);
                     g_presenter_next_slot = fg::now_seconds() + std::max(out_interval, g_presenter_native_interval.load(std::memory_order_relaxed));
                 } else {
                     presenter_wait_slot(out_interval);
-                    presenter_copy_and_present(slot.generated, true);
+                    presenter_copy_and_present(slot.generated_present, slot.generated_present_mutex, true);
                     presenter_wait_slot(out_interval);
-                    presenter_copy_and_present(slot.real, false);
+                    if (slot.real_ready)
+                        presenter_copy_and_present(slot.real_present, slot.real_present_mutex, false);
                 }
             }
 
             {
                 std::lock_guard<std::mutex> lock(g_presenter_mutex);
                 slot.in_use = false;
+                slot.generated_ready = false;
+                slot.real_ready = false;
             }
         }
+
+        // Return ownership for packets that were queued when shutdown began, then tear down all
+        // presenter-side objects on the same thread that created them.
+        for (;;) {
+            int idx = -1;
+            {
+                std::lock_guard<std::mutex> lock(g_presenter_mutex);
+                if (g_presenter_ready.empty())
+                    break;
+                idx = g_presenter_ready.front();
+                g_presenter_ready.pop_front();
+                g_presenter_slots[idx].ready = false;
+                g_presenter_slots[idx].in_use = true;
+            }
+            presenter_worker_discard(g_presenter_slots[idx]);
+            std::lock_guard<std::mutex> lock(g_presenter_mutex);
+            g_presenter_slots[idx].in_use = false;
+            g_presenter_slots[idx].generated_ready = false;
+            g_presenter_slots[idx].real_ready = false;
+        }
+        presenter_worker_cleanup();
     }
 
     void presenter_stop()
@@ -866,17 +1037,17 @@ namespace fgx
         g_presenter_cv.notify_all();
         if (g_presenter_thread.joinable())
             g_presenter_thread.join();
+
         g_presenter_running = false;
         g_presenter_stop = false;
+        g_presenter_worker_ready.store(false, std::memory_order_relaxed);
+        g_presenter_worker_failed.store(false, std::memory_order_relaxed);
+        g_presenter_force_hide.store(true, std::memory_order_relaxed);
+        g_presenter_effect_runtime = nullptr;
 
         std::lock_guard<std::mutex> lock(g_presenter_mutex);
-        presenter_release_resources();
-        if (g_presenter_mt) {
-            g_presenter_mt->SetMultithreadProtected(g_presenter_prev_mt);
-            release(g_presenter_mt);
-        }
-        presenter_destroy_window();
-        g_presenter_status = "off";
+        presenter_release_game_resources();
+        g_presenter_status.store("off", std::memory_order_relaxed);
     }
 
     bool presenter_start_or_rebuild(reshade::api::effect_runtime *runtime, ID3D11Texture2D *game_bb)
@@ -889,45 +1060,37 @@ namespace fgx
         if (!hwnd)
             return false;
 
-        bool rebuild = !g_presenter_swap || g_presenter_device != fg::g_dev ||
+        bool rebuild = !g_presenter_running || g_presenter_device != fg::g_dev ||
                        g_presenter_game_hwnd != hwnd ||
                        g_presenter_width != d.Width || g_presenter_height != d.Height ||
                        g_presenter_format != d.Format;
         if (rebuild) {
-            // No queue item is allowed to reference resources while they are recreated.
             if (g_presenter_running)
                 presenter_stop();
-            if (!presenter_create_swapchain_and_slots(hwnd, d.Width, d.Height, d.Format))
+            if (!presenter_prepare_game_resources(hwnd, d.Width, d.Height, d.Format))
                 return false;
-        }
-        if (!g_presenter_running) {
             g_presenter_stop = false;
+            g_presenter_force_hide.store(false, std::memory_order_relaxed);
             g_presenter_thread = std::thread(presenter_thread_main);
             g_presenter_running = true;
         }
-        return true;
+        return !g_presenter_worker_failed.load(std::memory_order_acquire);
     }
 
     int presenter_acquire_slot()
     {
         std::lock_guard<std::mutex> lock(g_presenter_mutex);
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < 3; ++i) {
             if (!g_presenter_slots[i].ready && !g_presenter_slots[i].in_use)
                 return i;
-
-        // All free slots may be queued. Drop the oldest queued packet, never the one currently
-        // being presented, to keep latency bounded.
-        if (!g_presenter_ready.empty()) {
-            int i = g_presenter_ready.front();
-            g_presenter_ready.pop_front();
-            g_presenter_slots[i].ready = false;
-            g_presenter_dropped_packets.fetch_add(1, std::memory_order_relaxed);
-            return i;
         }
+        // Stability-first policy: never steal a queued/in-flight slot. Dropping a new synthetic
+        // packet is safe; reusing a resource before the worker returned key 0 is not.
+        g_presenter_dropped_packets.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
 
-    void presenter_enqueue_slot(int idx, bool warmup_only, unsigned long long serial)
+    void presenter_enqueue_slot(int idx, bool warmup_only, bool generated_ready, unsigned long long serial)
     {
         if (idx < 0 || idx >= 3)
             return;
@@ -935,6 +1098,8 @@ namespace fgx
             std::lock_guard<std::mutex> lock(g_presenter_mutex);
             PresenterSlot &slot = g_presenter_slots[idx];
             slot.warmup_only = warmup_only;
+            slot.generated_ready = generated_ready;
+            slot.real_ready = true;
             slot.serial = serial;
             slot.ready = true;
             g_presenter_ready.push_back(idx);
@@ -944,45 +1109,44 @@ namespace fgx
 
     void run_independent_presenter(reshade::api::effect_runtime *runtime)
     {
-        // This path purposely does not call the original extra-Present logic. It reuses all of the
-        // original capture/flow/interpolation resources, but queues output into the independent
-        // presenter instead of consuming the game's swapchain slots.
         if (fg::g_inside_extra_present || g_inside_presenter_present)
             return;
         const unsigned long long frame_index = fg::g_real_frames.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!fg::g_settings.enabled) {
             fg::g_status = "disabled";
             fg::g_have_prev = false;
-            presenter_hide_window();
+            g_presenter_force_hide.store(true, std::memory_order_relaxed);
             return;
         }
+        g_presenter_force_hide.store(false, std::memory_order_relaxed);
+        g_presenter_self_pacing_runtime.store(g_settings.presenter_self_pacing, std::memory_order_relaxed);
+        g_presenter_hide_unfocused_runtime.store(g_settings.presenter_hide_unfocused, std::memory_order_relaxed);
 
         reshade::api::device *api_device = runtime ? runtime->get_device() : nullptr;
         if (!api_device || api_device->get_api() != reshade::api::device_api::d3d11) {
-            g_presenter_status = "independent presenter is DX11-only";
-            // Preserve the old implementation for DX12/Vulkan/etc. rather than breaking them.
+            g_presenter_status.store("independent presenter is DX11-only", std::memory_order_relaxed);
             run_original_with_output_mode(runtime);
             return;
         }
 
         ID3D11Device *dev = reinterpret_cast<ID3D11Device *>(api_device->get_native());
         if (!dev || !fg::ensure_device(dev)) {
-            g_presenter_status = "D3D11 pipeline unavailable";
+            g_presenter_status.store("D3D11 pipeline unavailable", std::memory_order_relaxed);
             return;
         }
         reshade::api::resource br = runtime->get_current_back_buffer();
         ID3D11Texture2D *bb = reinterpret_cast<ID3D11Texture2D *>(br.handle);
         if (!bb || !fg::ensure_resources(bb)) {
-            g_presenter_status = "backbuffer/resources unavailable";
+            g_presenter_status.store("backbuffer/resources unavailable", std::memory_order_relaxed);
             return;
         }
         if (!presenter_start_or_rebuild(runtime, bb))
             return;
-        presenter_sync_window();
 
-        // Legacy AA/temporal reconstruction are useful quality options, but they are additional
-        // full-screen work on every REAL game frame. In True Additive they are isolated by default
-        // so a user testing RenoDX/NR does not unknowingly stack another heavy real-frame pass.
+        // Wait for the worker to finish its separate-device/swapchain setup without blocking the
+        // game thread. Until then we simply maintain the original capture history.
+        const bool worker_ready = g_presenter_worker_ready.load(std::memory_order_acquire);
+
         if (g_settings.reuse_legacy_postprocess && fg::g_settings.aa)
             fg::apply_aa(bb);
         fg::g_ctx->CopyResource(fg::g_curr_tex, bb);
@@ -996,7 +1160,7 @@ namespace fgx
 
         double cb_entry = fg::now_seconds();
         if (fg::g_prev_cb_entry > 0.0) {
-            double native = cb_entry - fg::g_prev_cb_entry; // no presenter wait occurs on this thread
+            double native = cb_entry - fg::g_prev_cb_entry;
             if (native > 0.0001 && native < 0.5)
                 fg::g_dt_ema = (fg::g_dt_ema > 0.0) ? (fg::g_dt_ema * 0.9 + native * 0.1) : native;
         }
@@ -1008,27 +1172,41 @@ namespace fgx
         fg::g_last_wait_total = 0.0;
         fg::g_paced_ms = 0.0;
 
-        int slot_idx = presenter_acquire_slot();
-        if (slot_idx >= 0) {
-            PresenterSlot &slot = g_presenter_slots[slot_idx];
-            // Always queue the actual real frame; on the warm-up frame there is no previous real
-            // frame yet, so it is the only thing the output presenter displays.
-            fg::g_ctx->CopyResource(slot.real, fg::g_curr_tex);
-            bool warmup = !fg::g_have_prev;
-            bool generated_ok = false;
-            if (!warmup && fg::g_settings.debug_mode == 0) {
-                generated_ok = fg::draw_interpolated(slot.generated, 0.5f, !flow_ready);
-                if (generated_ok)
-                    fg::g_gen_frames.fetch_add(1, std::memory_order_relaxed);
+        if (worker_ready) {
+            int slot_idx = presenter_acquire_slot();
+            if (slot_idx >= 0) {
+                PresenterSlot &slot = g_presenter_slots[slot_idx];
+                bool real_locked = slot.real_game_mutex && SUCCEEDED(slot.real_game_mutex->AcquireSync(0u, 0u));
+                if (real_locked) {
+                    fg::g_ctx->CopyResource(slot.real, fg::g_curr_tex);
+                    slot.real_game_mutex->ReleaseSync(1u);
+
+                    const bool warmup = !fg::g_have_prev;
+                    bool generated_locked = false;
+                    bool generated_ok = false;
+                    if (!warmup && fg::g_settings.debug_mode == 0 && slot.generated_game_mutex &&
+                        SUCCEEDED(slot.generated_game_mutex->AcquireSync(0u, 0u))) {
+                        generated_locked = true;
+                        generated_ok = fg::draw_interpolated(slot.generated, 0.5f, !flow_ready);
+                        slot.generated_game_mutex->ReleaseSync(1u);
+                        if (generated_ok)
+                            fg::g_gen_frames.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    // If a generated texture was handed to key 1 but drawing failed, the worker
+                    // still drains it before freeing the slot so ownership cannot get stranded.
+                    presenter_enqueue_slot(slot_idx, warmup || !generated_ok, generated_locked, frame_index);
+                } else {
+                    g_presenter_sync_misses.fetch_add(1, std::memory_order_relaxed);
+                }
             }
-            presenter_enqueue_slot(slot_idx, warmup || !generated_ok, frame_index);
         }
 
         std::swap(fg::g_prev_tex, fg::g_curr_tex);
         std::swap(fg::g_prev_srv, fg::g_curr_srv);
         fg::g_have_prev = true;
-        fg::g_status = "independent additive presenter";
-        g_presenter_status = "running";
+        fg::g_status = "independent additive presenter V3";
+        if (worker_ready)
+            g_presenter_status.store("running - separate device/thread", std::memory_order_relaxed);
     }
 
     void run_original_with_output_mode(reshade::api::effect_runtime *runtime)
@@ -1155,13 +1333,16 @@ namespace fgx
         const char *output_items[] = {
             "Legacy: original paced in-swapchain FG",
             "Legacy: immediate extra Present (no wait)",
-            "TRUE ADDITIVE: independent presenter (DX11, x2)"
+            "TRUE ADDITIVE V3: isolated presenter (DX11, x2)"
         };
         int old_output_mode = g_settings.output_mode;
         if (ImGui::Combo("Output backend", &g_settings.output_mode, output_items, 3)) {
             if (old_output_mode == 2 && g_settings.output_mode != 2)
                 presenter_stop();
             if (old_output_mode != 2 && g_settings.output_mode == 2) {
+                // This selection happens from inside the ReShade overlay. Keep the presenter
+                // hidden until the overlay-close event (Home) explicitly publishes false.
+                g_reshade_overlay_open.store(true, std::memory_order_release);
                 // Do not inherit the legacy pacer's free-running clock or interval history.
                 fg::g_slot = 0.0;
                 fg::g_last_wait_total = 0.0;
@@ -1176,17 +1357,20 @@ namespace fgx
             ImGui::Checkbox("Reuse legacy AA / temporal reconstruction", &g_settings.reuse_legacy_postprocess);
             ImGui::Checkbox("Hide presenter when game is unfocused", &g_settings.presenter_hide_unfocused);
             ImGui::TextDisabled("True Additive hard-bypasses legacy Extra Present / Pace / injected-vblank controls.");
-            ImGui::TextDisabled("The presenter uses Present(0); timing waits live only on its worker thread, never the game thread.");
+            ImGui::TextDisabled("V3: presenter owns a separate D3D11 device/context + HWND/swapchain on its worker thread.");
+            ImGui::TextDisabled("Game/presenter exchange frames only through shared keyed-mutex textures; the game immediate context never leaves its thread.");
             ImGui::TextDisabled("Secondary presenter ReShade effects are disabled to avoid running RenoDX/NR twice.");
             ImGui::TextDisabled("DX11 + windowed/borderless + x2 only. Exclusive fullscreen is unsupported; HDR is experimental.");
-            ImGui::Text("Presenter: %s", g_presenter_status);
+            ImGui::Text("Presenter: %s", g_presenter_status.load(std::memory_order_relaxed));
             ImGui::Text("Game real: %.1f FPS | target output: %.1f FPS | actual output: %.1f FPS",
                 g_presenter_game_fps.load(std::memory_order_relaxed),
                 g_presenter_target_fps.load(std::memory_order_relaxed),
                 g_presenter_output_fps.load(std::memory_order_relaxed));
-            ImGui::Text("Display refresh: %.1f Hz | tearing: %s", g_presenter_refresh_hz, g_presenter_tearing_supported ? "supported" : "unavailable");
-            ImGui::Text("Presenter real/gen: %llu / %llu | dropped packets: %llu",
-                g_presenter_real_presents.load(), g_presenter_generated_presents.load(), g_presenter_dropped_packets.load());
+            ImGui::Text("Display refresh: %.1f Hz | tearing: %s",
+                g_presenter_refresh_hz.load(std::memory_order_relaxed),
+                g_presenter_tearing_supported.load(std::memory_order_relaxed) ? "supported" : "unavailable");
+            ImGui::Text("Presenter real/gen: %llu / %llu | dropped packets: %llu | sync misses: %llu",
+                g_presenter_real_presents.load(), g_presenter_generated_presents.load(), g_presenter_dropped_packets.load(), g_presenter_sync_misses.load());
             if (fg::g_settings.extra_present || fg::g_settings.pace || fg::g_settings.present_sync != 0)
                 ImGui::TextDisabled("Legacy output switches are currently ON in FrameGen Preview, but are suspended in this backend.");
             if (fg::g_settings.multiplier != 2)
@@ -1230,9 +1414,10 @@ namespace fgx
 
     bool on_reshade_open_overlay(reshade::api::effect_runtime *, bool open, reshade::api::input_source)
     {
-        g_reshade_overlay_open = open;
-        if (open)
-            presenter_hide_window();
+        // Do not call ShowWindow/SetWindowPos from ReShade's game/UI thread. The presenter HWND is
+        // owned by its worker; merely publish visibility state and wake that thread.
+        g_reshade_overlay_open.store(open, std::memory_order_release);
+        g_presenter_cv.notify_all();
         return false;
     }
 
@@ -1241,7 +1426,8 @@ namespace fgx
         if (!runtime)
             return;
         const HWND hwnd = reinterpret_cast<HWND>(runtime->get_hwnd());
-        if (g_presenter_hwnd && hwnd == g_presenter_hwnd) {
+        HWND presenter_hwnd = g_presenter_hwnd.load(std::memory_order_acquire);
+        if (presenter_hwnd && hwnd == presenter_hwnd) {
             // The presenter's own swapchain may be seen by ReShade as a second runtime. Never run
             // the user's effects (especially RenoDX/DLSS NR) on it a second time. The queued real
             // and generated textures already contain the desired game-side effect result.
@@ -1266,7 +1452,8 @@ namespace fgx
         if (!runtime || g_inside_presenter_present)
             return;
         const HWND hwnd = reinterpret_cast<HWND>(runtime->get_hwnd());
-        if (g_presenter_hwnd && hwnd == g_presenter_hwnd)
+        HWND presenter_hwnd = g_presenter_hwnd.load(std::memory_order_acquire);
+        if (presenter_hwnd && hwnd == presenter_hwnd)
             return;
         run(runtime);
     }
