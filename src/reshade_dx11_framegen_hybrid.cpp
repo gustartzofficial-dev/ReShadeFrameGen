@@ -28,6 +28,7 @@ namespace fgx
         float occlusion_strength = 1.15f;
         float depth_rejection_strength = 1.0f;
         bool enhanced_disocclusion = true;
+        bool preserve_native_fps = false; // additive output: never pace/wait the game's real Present
         bool show_status = true;
     };
 
@@ -376,12 +377,39 @@ namespace fgx
         fg::g_ctx->UpdateSubresource(g_hybrid_cb, 0, nullptr, &cb, 0, 0);
     }
 
+    void run_original_with_output_mode(reshade::api::effect_runtime *runtime)
+    {
+        // The original pacer intentionally holds the game's real Present so interpolated frames
+        // can occupy evenly spaced slots. That is useful for smooth pacing, but on a vsync/capped
+        // title the added wait can push the real Present past its next display slot and effectively
+        // cut the native cadence in half. Additive mode keeps the old implementation available but
+        // temporarily bypasses those waits: generated Presents are immediate and the real Present
+        // is returned to the game as soon as our rendering work is finished.
+        const bool override_output = g_settings.preserve_native_fps && fg::g_settings.extra_present;
+        const bool saved_pace = fg::g_settings.pace;
+        const int saved_sync = fg::g_settings.present_sync;
+
+        if (override_output) {
+            fg::g_settings.pace = false;
+            fg::g_settings.present_sync = 0;
+        }
+
+        fg::run(runtime);
+
+        // Preserve the user's settings in the original FrameGen Preview tab. Additive mode is a
+        // runtime override only, so turning it back off restores the exact old paced behaviour.
+        if (override_output) {
+            fg::g_settings.pace = saved_pace;
+            fg::g_settings.present_sync = saved_sync;
+        }
+    }
+
     void run(reshade::api::effect_runtime *runtime)
     {
         // Preserve the existing implementation byte-for-byte when Original is selected.
         if (!wants_external_backend()) {
             g_extension_status = "Original optical flow (unchanged)";
-            fg::run(runtime);
+            run_original_with_output_mode(runtime);
             return;
         }
 
@@ -391,7 +419,7 @@ namespace fgx
             // If the original pipeline was torn down (device switch / DX12 toggle), discard any
             // extension objects tied to the old D3D11 device before rebuilding.
             release_extension_pipeline();
-            fg::run(runtime);
+            run_original_with_output_mode(runtime);
             if (fg::g_pipeline_ready && fg::g_dev)
                 ensure_extension_pipeline();
             return;
@@ -403,7 +431,7 @@ namespace fgx
             g_extension_status = g_external_mv_found ?
                 "Hybrid unavailable - Original fallback" :
                 "texMotionVectors not found - Original fallback";
-            fg::run(runtime);
+            run_original_with_output_mode(runtime);
             return;
         }
 
@@ -428,7 +456,7 @@ namespace fgx
         g_extension_status = (motion_mode == 1) ?
             "External texMotionVectors" :
             "Hybrid texMotionVectors + optical residual";
-        fg::run(runtime);
+        run_original_with_output_mode(runtime);
 
         fg::g_ps_flow = original_flow;
         fg::g_ps_interp = original_interp;
@@ -456,6 +484,19 @@ namespace fgx
         };
         ImGui::Combo("Motion backend", &g_settings.motion_backend, items, 4);
 
+        ImGui::Separator();
+        ImGui::Text("Frame output / pacing");
+        ImGui::Checkbox("Additive FG / preserve native FPS", &g_settings.preserve_native_fps);
+        if (g_settings.preserve_native_fps) {
+            ImGui::TextDisabled("Does not wait before the game's real Present. Generated Presents are immediate.");
+            ImGui::TextDisabled("Best for recovering output FPS when a heavy effect lowers the real-frame rate.");
+            ImGui::TextDisabled("The original 'Pace frames' setting is temporarily overridden, not changed.");
+            if (fg::g_settings.multiplier > 2)
+                ImGui::TextDisabled("Tip: x2 is recommended in additive mode; x3/x4 inject multiple frames back-to-back.");
+        } else {
+            ImGui::TextDisabled("Off = original paced behaviour from the FrameGen Preview tab.");
+        }
+
         if (g_settings.motion_backend != original) {
             ImGui::SliderFloat("External MV scale X", &g_settings.motion_scale_x, -4.0f, 4.0f, "%.3f");
             ImGui::SliderFloat("External MV scale Y", &g_settings.motion_scale_y, -4.0f, 4.0f, "%.3f");
@@ -471,6 +512,7 @@ namespace fgx
             if (g_external_mv_effect[0] != '\0')
                 ImGui::Text("Provider effect: %s", g_external_mv_effect);
             ImGui::Text("Backend: %s", g_extension_status);
+            ImGui::Text("Output mode: %s", g_settings.preserve_native_fps ? "Additive / preserve native FPS" : "Original paced output");
             ImGui::TextDisabled("Uses the community UV-space texMotionVectors contract (qUINT / ReShadeMotionEstimation / Feeder ecosystem).");
             ImGui::TextDisabled("No NVIDIA DLLs are bundled. DLSS/NR effects may still run normally before reshade_present; this addon then interpolates the resulting real frames.");
             ImGui::TextDisabled("DX12 keeps the existing D3D11On12 backend and falls back to Original motion for now.");
@@ -501,7 +543,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved)
         // original fg::run directly whenever Original/fallback is active.
         reshade::unregister_event<reshade::addon_event::reshade_present>(&on_reshade_present);
         reshade::register_event<reshade::addon_event::reshade_present>(&fgx::on_present);
-        reshade::register_overlay("Hybrid Motion", &fgx::draw_overlay);
+        reshade::register_overlay("Hybrid Motion + Output", &fgx::draw_overlay);
         break;
 
     case DLL_PROCESS_DETACH:
