@@ -40,6 +40,7 @@ target_link_libraries(ReShadeDX11FrameGen PRIVATE
     dxgi
     d3dcompiler
     user32
+    dwmapi
 )
 
 # Emit the PE DLL directly with ReShade's add-on extension. This avoids producing
