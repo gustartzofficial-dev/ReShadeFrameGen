@@ -70,11 +70,24 @@ Snapshot g_state{};
 
 ULONGLONG g_last_probe_ms = 0;
 ULONGLONG g_last_poll_ms = 0;
-uint64_t g_app_presents_since_poll = 0;
+std::atomic<uint64_t> g_app_presents_since_poll{0};
+std::atomic_bool g_reset_fps_counters{true};
 uint64_t g_dlssg_presents_since_poll = 0;
 uint32_t g_frame_index = 0;
-bool g_first_endpoint_frame = true;
+std::atomic_bool g_reset_next_capture{true};
 bool g_dlssg_was_enabled = false;
+
+// v0.7 never calls Streamline/DXGI Present from inside ReShade's reshade_present callback.
+// The game thread only copies the completed NR frame into a free bridge slot and signals an
+// input fence. A dedicated worker owns frame tokens, DLSS-G calls and the private swapchain.
+std::atomic_bool g_fg_worker_stop{false};
+std::atomic_bool g_fg_worker_running{false};
+std::atomic_bool g_fg_worker_busy{false};
+HANDLE g_fg_worker_handle = nullptr;
+HANDLE g_fg_worker_wake = nullptr;
+DWORD g_fg_worker_id = 0;
+std::atomic<uint64_t> g_enqueued_frames{0};
+std::atomic<uint64_t> g_dropped_frames{0};
 
 std::wstring g_plugin_dir;
 std::array<const wchar_t *, 1> g_plugin_paths{};
@@ -85,7 +98,7 @@ constexpr std::array<sl::Feature, 3> k_requested_features = {
 };
 
 constexpr const char *k_project_id = "68c3c204-a7b9-43e0-a319-37b62eef12f7";
-constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.5-StableRing";
+constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.7-AsyncPresent";
 const sl::ViewportHandle k_viewport{0};
 
 // The private endpoint is deliberately created with the real system DLLs rather than the game's
@@ -98,10 +111,11 @@ using CreateDXGIFactory2Proc = HRESULT (WINAPI *)(UINT, REFIID, void **);
 D3D12CreateDeviceProc g_d3d12_create_device = nullptr;
 CreateDXGIFactory2Proc g_create_dxgi_factory2 = nullptr;
 
-// ReShade DXGI proxies expose their original COM object through this private IID.
-// Keeping the D3D12 DEVICE ReShade-visible is intentional (RenoDX/Feeder need to see NGX),
-// but the DLSS-G PRESENTATION SWAPCHAIN must be created on the unwrapped factory so ReShade
-// does not create a second effect_runtime and make DLSS5-Feeder switch away from the game.
+// ReShade D3D/DXGI proxies expose their original COM object through this private IID.
+// v0.7 unwraps BOTH the private D3D12 device and the factory before giving them to Streamline.
+// RenoDX does not need a ReShade wrapper around this FG-only device: its NGX detours are process
+// wide and the v0.6 log already proved it sees feature 11. Keeping a single native identity here
+// avoids proxy-on-proxy command queues/resources while the game's Feeder/NR device remains intact.
 constexpr GUID k_reshade_unwrapped_object =
     { 0x7f2c9a11, 0x3b4e, 0x4d6a, { 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
 
@@ -137,7 +151,7 @@ ComPtr<ID3D12GraphicsCommandList> g_command_list;
 ComPtr<ID3D12Fence> g_input_fence12;
 ComPtr<ID3D11Fence> g_input_fence11;
 ComPtr<ID3D12Fence> g_release_fence12;
-ComPtr<ID3D11Fence> g_release_fence11;
+HANDLE g_input_fence_event = nullptr;
 HANDLE g_release_fence_event = nullptr;
 uint64_t g_input_fence_value = 0;
 uint64_t g_release_fence_value = 0;
@@ -201,18 +215,34 @@ struct SharedTexture
     }
 };
 
+enum class BridgeSlotState : uint32_t
+{
+    free = 0,
+    capturing,
+    queued,
+    processing,
+    wait_release,
+};
+
 struct BridgeSlot
 {
     SharedTexture color;
     SharedTexture mv;
     SharedTexture depth;
+    std::atomic<BridgeSlotState> state{BridgeSlotState::free};
+    uint64_t input_ready_value = 0;
     uint64_t release_value = 0;
+    uint32_t frame_number = 0;
+    bool reset_history = false;
+    D3D11_TEXTURE2D_DESC color_desc{};
+    D3D11_TEXTURE2D_DESC mv_desc{};
+    D3D11_TEXTURE2D_DESC depth_desc{};
 
-    bool matches(const D3D11_TEXTURE2D_DESC &color_desc,
-                 const D3D11_TEXTURE2D_DESC &mv_desc,
-                 const D3D11_TEXTURE2D_DESC &depth_desc) const
+    bool matches(const D3D11_TEXTURE2D_DESC &color_desc_in,
+                 const D3D11_TEXTURE2D_DESC &mv_desc_in,
+                 const D3D11_TEXTURE2D_DESC &depth_desc_in) const
     {
-        return color.matches(color_desc) && mv.matches(mv_desc) && depth.matches(depth_desc);
+        return color.matches(color_desc_in) && mv.matches(mv_desc_in) && depth.matches(depth_desc_in);
     }
 
     void reset()
@@ -220,11 +250,99 @@ struct BridgeSlot
         color.reset();
         mv.reset();
         depth.reset();
+        input_ready_value = 0;
         release_value = 0;
+        frame_number = 0;
+        reset_history = false;
+        color_desc = {};
+        mv_desc = {};
+        depth_desc = {};
+        state.store(BridgeSlotState::free, std::memory_order_release);
     }
 };
 
 std::array<BridgeSlot, k_frame_ring_size> g_bridge_slots{};
+
+bool all_bridge_slots_idle()
+{
+    if (g_fg_worker_busy.load(std::memory_order_acquire))
+        return false;
+    for (const auto &slot : g_bridge_slots)
+        if (slot.state.load(std::memory_order_acquire) != BridgeSlotState::free)
+            return false;
+    return true;
+}
+
+void reclaim_completed_bridge_slots()
+{
+    if (!g_release_fence12)
+        return;
+    const uint64_t completed = g_release_fence12->GetCompletedValue();
+    for (auto &slot : g_bridge_slots)
+    {
+        if (slot.state.load(std::memory_order_acquire) == BridgeSlotState::wait_release &&
+            slot.release_value != 0 && completed >= slot.release_value)
+        {
+            slot.input_ready_value = 0;
+            slot.release_value = 0;
+            slot.state.store(BridgeSlotState::free, std::memory_order_release);
+        }
+    }
+}
+
+int acquire_free_bridge_slot()
+{
+    reclaim_completed_bridge_slots();
+    for (uint32_t i = 0; i < k_frame_ring_size; ++i)
+    {
+        auto expected = BridgeSlotState::free;
+        if (g_bridge_slots[i].state.compare_exchange_strong(expected, BridgeSlotState::capturing,
+                                                             std::memory_order_acq_rel))
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+int acquire_queued_bridge_slot()
+{
+    // Slots can be recycled independently. Always choose the oldest queued real frame rather than
+    // the lowest array index, otherwise a freshly-reused slot 0 could jump ahead of older frames
+    // still waiting in slots 1/2 and feed DLSS-G out of temporal order.
+    for (;;)
+    {
+        int candidate = -1;
+        uint32_t oldest_frame = static_cast<uint32_t>(-1);
+        for (uint32_t i = 0; i < k_frame_ring_size; ++i)
+        {
+            if (g_bridge_slots[i].state.load(std::memory_order_acquire) != BridgeSlotState::queued)
+                continue;
+            const uint32_t frame = g_bridge_slots[i].frame_number;
+            if (candidate < 0 || frame < oldest_frame)
+            {
+                candidate = static_cast<int>(i);
+                oldest_frame = frame;
+            }
+        }
+
+        if (candidate < 0)
+            return -1;
+
+        auto expected = BridgeSlotState::queued;
+        if (g_bridge_slots[static_cast<uint32_t>(candidate)].state.compare_exchange_strong(
+                expected, BridgeSlotState::processing, std::memory_order_acq_rel))
+            return candidate;
+        // A disable/drop may have raced the scan. Rescan rather than processing a stale slot.
+    }
+}
+
+void drop_queued_bridge_slots()
+{
+    for (auto &slot : g_bridge_slots)
+    {
+        auto expected = BridgeSlotState::queued;
+        slot.state.compare_exchange_strong(expected, BridgeSlotState::free, std::memory_order_acq_rel);
+    }
+}
 
 HWND g_game_hwnd = nullptr;
 HWND g_endpoint_hwnd = nullptr;
@@ -369,7 +487,7 @@ void resolve_feature_functions(Snapshot &s)
         if ((*g_get_feature_function)(sl::kFeatureReflex, "slReflexSleep", ptr) == sl::Result::eOk && ptr)
             g_reflex_sleep = reinterpret_cast<PFun_slReflexSleep *>(ptr);
     }
-    s.reflex_functions_ready = g_reflex_set_options != nullptr && g_reflex_sleep != nullptr;
+    s.reflex_functions_ready = g_reflex_set_options != nullptr;
 
     if (g_pcl_set_marker == nullptr)
     {
@@ -426,7 +544,7 @@ bool perform_bootstrap(bool early_device_creation)
     resolve_core_exports(module, s);
     if (!s.core_exports_ready)
     {
-        set_note(s, "sl.interposer.dll loaded, but v0.5 could not resolve the manual-hooking/frame-tagging exports it needs.");
+        set_note(s, "sl.interposer.dll loaded, but v0.7 could not resolve the manual-hooking/frame-tagging exports it needs.");
         std::lock_guard lock(g_state_mutex);
         g_state = s;
         return false;
@@ -449,7 +567,7 @@ bool perform_bootstrap(bool early_device_creation)
         pref.engine = sl::EngineType::eCustom;
         pref.engineVersion = k_engine_version;
 
-        // Critical v0.5 change: D3D11 games feed a PRIVATE SAME-ADAPTER D3D12 endpoint. The game's
+        // D3D11 games feed a PRIVATE SAME-ADAPTER D3D12 endpoint. The game's
         // D3D11 device remains native and is never handed to DLSS-G.
         pref.renderAPI = sl::RenderAPI::eD3D12;
         pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
@@ -472,11 +590,11 @@ bool perform_bootstrap(bool early_device_creation)
         }
 
         query_requirements(s);
-        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.6 can create the same-adapter D3D12 endpoint.");
+        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.7 can create the same-adapter D3D12 endpoint.");
     }
     else if (!early_device_creation)
     {
-        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.6 never calls slInit a second time late.");
+        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.7 never calls slInit a second time late.");
     }
 
     std::lock_guard lock(g_state_mutex);
@@ -613,7 +731,7 @@ void destroy_bridge_resources()
     }
     for (auto &slot : g_command_slots)
         slot.completed_value = 0;
-    g_first_endpoint_frame = true;
+    g_reset_next_capture.store(true, std::memory_order_release);
 }
 
 bool create_shared_texture(const D3D11_TEXTURE2D_DESC &src, SharedTexture &out, Snapshot &s)
@@ -716,7 +834,7 @@ bool create_shared_texture(const D3D11_TEXTURE2D_DESC &src, SharedTexture &out, 
 
 bool create_shared_fences(Snapshot &s)
 {
-    if (g_input_fence12 && g_input_fence11 && g_release_fence12 && g_release_fence11 && g_game_context11_4)
+    if (g_input_fence12 && g_input_fence11 && g_release_fence12 && g_game_context11_4)
         return true;
     if (!g_device12 || !g_game_device11_5 || !g_game_context11_4)
     {
@@ -726,54 +844,50 @@ bool create_shared_fences(Snapshot &s)
 
     g_input_fence11.Reset();
     g_input_fence12.Reset();
-    g_release_fence11.Reset();
     g_release_fence12.Reset();
     g_input_fence_value = 0;
     g_release_fence_value = 0;
 
-    auto make_shared_fence = [&](ComPtr<ID3D12Fence> &fence12, ComPtr<ID3D11Fence> &fence11,
-                                 const char *create_error, const char *open_error) -> bool
+    // Only the input fence crosses APIs: D3D11 signals after copying Color/MV/Depth and the FG
+    // worker waits on the D3D12 side. The release fence is native D3D12 only; the game thread
+    // merely polls GetCompletedValue() to decide whether a ring slot is reusable.
+    HRESULT hr = g_device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_input_fence12));
+    if (FAILED(hr))
     {
-        HRESULT hr = g_device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(fence12.ReleaseAndGetAddressOf()));
-        if (FAILED(hr))
-        {
-            set_hr(s, hr, create_error);
-            return false;
-        }
-
-        HANDLE handle = nullptr;
-        hr = g_device12->CreateSharedHandle(fence12.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
-        if (FAILED(hr) || handle == nullptr)
-        {
-            set_hr(s, FAILED(hr) ? hr : E_FAIL, create_error);
-            return false;
-        }
-
-        hr = g_game_device11_5->OpenSharedFence(handle, IID_PPV_ARGS(fence11.ReleaseAndGetAddressOf()));
-        CloseHandle(handle);
-        if (FAILED(hr))
-        {
-            set_hr(s, hr, open_error);
-            return false;
-        }
-        return true;
-    };
-
-    if (!make_shared_fence(g_input_fence12, g_input_fence11,
-                           "Failed to create/export the D3D11->D3D12 input fence.",
-                           "D3D11 failed to open the D3D11->D3D12 input fence."))
+        set_hr(s, hr, "Failed to create the shared D3D11->D3D12 input fence.");
         return false;
+    }
 
-    if (!make_shared_fence(g_release_fence12, g_release_fence11,
-                           "Failed to create/export the D3D12->D3D11 release fence.",
-                           "D3D11 failed to open the D3D12->D3D11 release fence."))
+    HANDLE handle = nullptr;
+    hr = g_device12->CreateSharedHandle(g_input_fence12.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
+    if (FAILED(hr) || handle == nullptr)
+    {
+        set_hr(s, FAILED(hr) ? hr : E_FAIL, "Failed to export the D3D11->D3D12 input fence.");
         return false;
+    }
 
+    hr = g_game_device11_5->OpenSharedFence(handle, IID_PPV_ARGS(&g_input_fence11));
+    CloseHandle(handle);
+    if (FAILED(hr))
+    {
+        set_hr(s, hr, "D3D11 failed to open the D3D11->D3D12 input fence.");
+        return false;
+    }
+
+    hr = g_device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_release_fence12));
+    if (FAILED(hr))
+    {
+        set_hr(s, hr, "Failed to create the native D3D12 ring-release fence.");
+        return false;
+    }
+
+    if (g_input_fence_event == nullptr)
+        g_input_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (g_release_fence_event == nullptr)
         g_release_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (g_release_fence_event == nullptr)
+    if (g_input_fence_event == nullptr || g_release_fence_event == nullptr)
     {
-        set_hr(s, HRESULT_FROM_WIN32(GetLastError()), "Failed to create the endpoint release-fence event.");
+        set_hr(s, HRESULT_FROM_WIN32(GetLastError()), "Failed to create the endpoint fence events.");
         return false;
     }
     return true;
@@ -851,11 +965,36 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
 
     if (!g_device12)
     {
-        HRESULT hr = g_d3d12_create_device(g_game_adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device12));
-        if (FAILED(hr))
+        // ReShade detours D3D12CreateDevice process-wide, even when the export was resolved from
+        // System32. Therefore first capture whatever interface comes back, then explicitly unwrap
+        // ReShade's proxy before Streamline ever sees it. All endpoint allocators/resources/fences
+        // are built from this same native ID3D12Device identity.
+        ComPtr<ID3D12Device> created_device;
+        HRESULT hr = g_d3d12_create_device(g_game_adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&created_device));
+        if (FAILED(hr) || !created_device)
         {
             set_hr(s, hr, "D3D12CreateDevice failed on the D3D11 game's adapter. DLSS-G endpoint cannot start.");
             return false;
+        }
+
+        IUnknown *unwrapped = nullptr;
+        const HRESULT unwrap_hr = created_device->QueryInterface(k_reshade_unwrapped_object,
+                                                                  reinterpret_cast<void **>(&unwrapped));
+        if (SUCCEEDED(unwrap_hr) && unwrapped != nullptr)
+        {
+            hr = unwrapped->QueryInterface(IID_PPV_ARGS(&g_device12));
+            unwrapped->Release();
+            if (FAILED(hr) || !g_device12)
+            {
+                set_hr(s, hr, "ReShade exposed its native D3D12 device, but ID3D12Device recovery failed.");
+                return false;
+            }
+            set_note(s, "Native D3D12 endpoint recovered behind ReShade; Streamline will use one device identity.");
+        }
+        else
+        {
+            // If ReShade did not wrap this call, the returned device is already native.
+            g_device12 = created_device;
         }
     }
     s.endpoint_device_created = g_device12 != nullptr;
@@ -968,8 +1107,8 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
         // is a ReShade DXGI proxy. Creating our swapchain through that proxy makes ReShade create
         // another effect_runtime. DLSS5-Feeder stores only one runtime globally, so that second
         // runtime steals Feeder away from the game's D3D11 runtime and RenoDX never sees its DLSS
-        // create/evaluate calls. Unwrap ONLY the factory; keep the private D3D12 device/queue
-        // ReShade-visible so RenoDX can continue observing the NGX work Feeder performs.
+        // create/evaluate calls. The D3D12 device was already unwrapped above; unwrap the factory
+        // as well so neither half of the endpoint creates a second ReShade runtime.
         ComPtr<IDXGIFactory4> created_factory;
         HRESULT hr = g_create_dxgi_factory2(0, IID_PPV_ARGS(&created_factory));
         if (FAILED(hr) || !created_factory)
@@ -1026,7 +1165,7 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
     }
 
     // These used to be one-shot setup operations. Keep retrying until both exist so a transient
-    // interop failure cannot leave the addon displaying READY while submit_real_frame can never run.
+    // interop failure cannot leave the addon displaying READY while the async worker can never run.
     if (!create_command_objects(s) || !create_shared_fences(s))
         return false;
 
@@ -1097,7 +1236,7 @@ bool create_proxy_swapchain(uint32_t width, uint32_t height, DXGI_FORMAT format,
     s.endpoint_height = height;
     s.endpoint_format = static_cast<uint32_t>(format);
     s.proxy_swapchain_ready = true;
-    g_first_endpoint_frame = true;
+    g_reset_next_capture.store(true, std::memory_order_release);
 
     // Disable the normal Alt+Enter behavior on our utility window.
     g_native_factory->MakeWindowAssociation(g_endpoint_hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
@@ -1116,13 +1255,27 @@ bool ensure_frame_bridge(ID3D11Texture2D *game_color, ID3D11Texture2D *mv, ID3D1
 
     if (cdesc.SampleDesc.Count != 1 || mdesc.SampleDesc.Count != 1 || ddesc.SampleDesc.Count != 1)
     {
-        set_note(s, "v0.6 requires single-sample color/MV/depth textures.");
+        set_note(s, "v0.7 requires single-sample color/MV/depth textures.");
         return false;
     }
+
+    reclaim_completed_bridge_slots();
 
     bool rebuild = false;
     for (const auto &slot : g_bridge_slots)
         rebuild |= !slot.matches(cdesc, mdesc, ddesc);
+
+    const DXGI_FORMAT wanted_format = typed_share_format(cdesc.Format);
+    const bool swapchain_rebuild = !g_proxy_swapchain || g_endpoint_width != cdesc.Width ||
+                                   g_endpoint_height != cdesc.Height || g_endpoint_format != wanted_format;
+
+    // Resize/reformat is rare. Never destroy resources underneath the worker: simply skip FG
+    // submissions until every old slot has retired, then rebuild on a later game Present.
+    if ((rebuild || swapchain_rebuild) && !all_bridge_slots_idle())
+    {
+        set_note(s, "FG endpoint resize/reformat is waiting for the async queue to drain; the game is not blocked.");
+        return false;
+    }
 
     if (rebuild)
     {
@@ -1139,14 +1292,14 @@ bool ensure_frame_bridge(ID3D11Texture2D *game_color, ID3D11Texture2D *mv, ID3D1
         }
     }
 
-    if (!create_proxy_swapchain(cdesc.Width, cdesc.Height, typed_share_format(cdesc.Format), s))
+    if (!create_proxy_swapchain(cdesc.Width, cdesc.Height, wanted_format, s))
         return false;
 
     const bool became_ready = !s.feeder_bridge_ready;
     s.feeder_bridge_ready = true;
     s.endpoint_hr = S_OK;
     if (became_ready)
-        set_note(s, "Three-frame bridge ready. DLSS-G can now be enabled.");
+        set_note(s, "Async three-frame bridge ready. DLSS-G can now be enabled.");
     return true;
 }
 
@@ -1158,7 +1311,7 @@ void set_identity(sl::float4x4 &m)
     m.row[3] = sl::float4(0.f, 0.f, 0.f, 1.f);
 }
 
-sl::Constants make_test_constants(uint32_t mv_width, uint32_t mv_height, uint32_t color_width, uint32_t color_height)
+sl::Constants make_test_constants(uint32_t mv_width, uint32_t mv_height, uint32_t color_width, uint32_t color_height, bool reset_history)
 {
     sl::Constants c{};
     set_identity(c.cameraViewToClip);
@@ -1179,7 +1332,7 @@ sl::Constants make_test_constants(uint32_t mv_width, uint32_t mv_height, uint32_
     c.depthInverted = g_depth_inverted.load(std::memory_order_relaxed) ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     c.cameraMotionIncluded = sl::Boolean::eTrue;
     c.motionVectors3D = sl::Boolean::eFalse;
-    c.reset = g_first_endpoint_frame ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    c.reset = reset_history ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     c.orthographicProjection = sl::Boolean::eFalse;
     c.motionVectorsDilated = sl::Boolean::eFalse;
     c.motionVectorsJittered = sl::Boolean::eFalse;
@@ -1194,11 +1347,9 @@ bool emit_marker(sl::PCLMarker marker, const sl::FrameToken &token, Snapshot &s)
     return s.last_pcl_marker == sl::Result::eOk;
 }
 
-bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
+bool capture_real_frame_nonblocking(reshade::api::effect_runtime *runtime, Snapshot &s)
 {
-    if (!runtime || !g_game_device11 || !g_game_context11_4 || !g_native_queue12 ||
-        !g_input_fence12 || !g_input_fence11 || !g_release_fence12 || !g_release_fence11 ||
-        !g_proxy_swapchain || !g_command_list)
+    if (!runtime || !g_game_context11 || !g_game_context11_4 || !g_input_fence11)
         return false;
 
     guides::NativeTextures guide{};
@@ -1206,7 +1357,6 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
     {
         s.feeder_mv_acquired = guide.motion_vectors != nullptr;
         s.feeder_depth_acquired = guide.depth != nullptr;
-        set_note(s, "DLSS5_Feed.fx is present, but its MV/depth D3D11 texture bindings are not available this frame.");
         return false;
     }
     s.feeder_mv_acquired = true;
@@ -1215,59 +1365,141 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
     const reshade::api::resource backbuffer = runtime->get_current_back_buffer();
     if (backbuffer.handle == 0)
         return false;
-    ID3D11Texture2D *game_color = reinterpret_cast<ID3D11Texture2D *>(static_cast<uintptr_t>(backbuffer.handle));
+    auto *game_color = reinterpret_cast<ID3D11Texture2D *>(static_cast<uintptr_t>(backbuffer.handle));
 
     if (!ensure_frame_bridge(game_color, guide.motion_vectors, guide.depth, s))
         return false;
 
-    D3D11_TEXTURE2D_DESC cdesc{}, mdesc{}, ddesc{};
-    game_color->GetDesc(&cdesc);
-    guide.motion_vectors->GetDesc(&mdesc);
-    guide.depth->GetDesc(&ddesc);
-
-    const uint32_t frame_number = ++g_frame_index;
-    const uint32_t slot_index = (frame_number - 1) % k_frame_ring_size;
-    BridgeSlot &bridge = g_bridge_slots[slot_index];
-    CommandSlot &slot = g_command_slots[slot_index];
-
-    // Only wait when recycling a slot from three real frames ago. This wait is inserted on the
-    // D3D11 GPU queue, so the CPU is free to continue unless the D3D12 allocator itself is still
-    // outstanding. v0.4 instead waited on the immediately previous frame and serialized both GPUs.
-    if (bridge.release_value != 0)
+    const int slot_index = acquire_free_bridge_slot();
+    if (slot_index < 0)
     {
-        const HRESULT whr = g_game_context11_4->Wait(g_release_fence11.Get(), bridge.release_value);
-        if (FAILED(whr))
-        {
-            set_hr(s, whr, "D3D11 failed to wait for a recyclable frame-bridge slot.");
-            return false;
-        }
+        // Backpressure policy for v0.7: never stall the game/NR pipeline for frame generation.
+        // If the worker is three frames behind, simply skip this FG input and try again next frame.
+        g_dropped_frames.fetch_add(1, std::memory_order_relaxed);
+        g_reset_next_capture.store(true, std::memory_order_release);
+        return false;
     }
+
+    BridgeSlot &bridge = g_bridge_slots[static_cast<uint32_t>(slot_index)];
+    game_color->GetDesc(&bridge.color_desc);
+    guide.motion_vectors->GetDesc(&bridge.mv_desc);
+    guide.depth->GetDesc(&bridge.depth_desc);
+    bridge.frame_number = ++g_frame_index;
+    bridge.reset_history = g_reset_next_capture.exchange(false, std::memory_order_acq_rel);
+    bridge.release_value = 0;
 
     g_game_context11->CopyResource(bridge.color.d11.Get(), game_color);
     g_game_context11->CopyResource(bridge.mv.d11.Get(), guide.motion_vectors);
     g_game_context11->CopyResource(bridge.depth.d11.Get(), guide.depth);
 
-    const uint64_t input_ready = ++g_input_fence_value;
-    HRESULT hr = g_game_context11_4->Signal(g_input_fence11.Get(), input_ready);
+    bridge.input_ready_value = ++g_input_fence_value;
+    const HRESULT hr = g_game_context11_4->Signal(g_input_fence11.Get(), bridge.input_ready_value);
     if (FAILED(hr))
     {
-        set_hr(s, hr, "D3D11 failed to signal the Feeder input fence.");
-        return false;
-    }
-    g_game_context11->Flush();
-    hr = g_native_queue12->Wait(g_input_fence12.Get(), input_ready);
-    if (FAILED(hr))
-    {
-        set_hr(s, hr, "D3D12 endpoint queue failed to wait for D3D11 Feeder inputs.");
+        bridge.state.store(BridgeSlotState::free, std::memory_order_release);
+        set_hr(s, hr, "D3D11 failed to signal the async Feeder input fence.");
         return false;
     }
 
+    // Flush submits the D3D11 copy/fence packet but does not wait for it. The worker's native
+    // D3D12 queue performs the cross-API wait, so the game's Present can continue immediately.
+    g_game_context11->Flush();
+    bridge.state.store(BridgeSlotState::queued, std::memory_order_release);
+    g_enqueued_frames.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool retire_bridge_slot(uint32_t slot_index, Snapshot &s)
+{
+    BridgeSlot &bridge = g_bridge_slots[slot_index];
+    CommandSlot &slot = g_command_slots[slot_index];
+
+    const uint64_t release_value = ++g_release_fence_value;
+    const HRESULT hr = g_native_queue12->Signal(g_release_fence12.Get(), release_value);
+    if (FAILED(hr))
+    {
+        // Do not make this slot reusable when queue ordering itself failed. A device-removed path
+        // is safer than letting D3D11 overwrite memory which the endpoint might still reference.
+        set_hr(s, hr, "Failed to signal safe reuse of an async frame-bridge slot.");
+        return false;
+    }
+
+    bridge.release_value = release_value;
+    slot.completed_value = release_value;
+    bridge.state.store(BridgeSlotState::wait_release, std::memory_order_release);
+    return true;
+}
+
+void update_worker_fps(Snapshot &s, const sl::DLSSGState &state)
+{
+    if (g_reset_fps_counters.exchange(false, std::memory_order_acq_rel))
+    {
+        g_dlssg_presents_since_poll = 0;
+        g_last_poll_ms = 0;
+        g_app_presents_since_poll.store(0, std::memory_order_release);
+    }
+
+    g_dlssg_presents_since_poll += state.numFramesActuallyPresented;
+    const ULONGLONG now = GetTickCount64();
+    if (g_last_poll_ms == 0)
+    {
+        g_last_poll_ms = now;
+        return;
+    }
+    if (now - g_last_poll_ms < 500)
+        return;
+
+    const double seconds = static_cast<double>(now - g_last_poll_ms) / 1000.0;
+    g_last_poll_ms = now;
+    const uint64_t app_frames = g_app_presents_since_poll.exchange(0, std::memory_order_acq_rel);
+    if (seconds > 0.0)
+    {
+        s.app_present_fps = static_cast<double>(app_frames) / seconds;
+        s.output_fps = static_cast<double>(g_dlssg_presents_since_poll) / seconds;
+    }
+    g_dlssg_presents_since_poll = 0;
+}
+
+bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
+{
+    if (!g_native_queue12 || !g_input_fence12 || !g_release_fence12 || !g_proxy_swapchain ||
+        !g_command_list || !g_get_new_frame_token || !g_set_tag_for_frame || !g_set_constants ||
+        !g_set_options || !g_get_state)
+    {
+        g_bridge_slots[slot_index].state.store(BridgeSlotState::free, std::memory_order_release);
+        return false;
+    }
+
+    BridgeSlot &bridge = g_bridge_slots[slot_index];
+    CommandSlot &slot = g_command_slots[slot_index];
+    const D3D11_TEXTURE2D_DESC cdesc = bridge.color_desc;
+    const D3D11_TEXTURE2D_DESC mdesc = bridge.mv_desc;
+    const D3D11_TEXTURE2D_DESC ddesc = bridge.depth_desc;
+    const uint32_t frame_number = bridge.frame_number;
+
+    // The game thread has already submitted the copies and returned. Wait for their shared fence
+    // here on the FG worker CPU thread before Streamline can inspect/tag the resources. This is
+    // deliberately conservative and cannot reduce the game's simulation/render FPS.
+    if (g_input_fence12->GetCompletedValue() < bridge.input_ready_value)
+    {
+        if (g_input_fence_event == nullptr ||
+            FAILED(g_input_fence12->SetEventOnCompletion(bridge.input_ready_value, g_input_fence_event)) ||
+            WaitForSingleObject(g_input_fence_event, 2000) != WAIT_OBJECT_0)
+        {
+            bridge.state.store(BridgeSlotState::free, std::memory_order_release);
+            set_hr(s, DXGI_ERROR_DEVICE_HUNG, "Timed out waiting for the D3D11 Feeder copies on the FG worker.");
+            return false;
+        }
+    }
+
+    HRESULT hr = S_OK;
     sl::FrameToken *token = nullptr;
     s.last_get_frame_token = (*g_get_new_frame_token)(token, &frame_number);
     s.frame_token_ready = s.last_get_frame_token == sl::Result::eOk && token != nullptr;
     if (!s.frame_token_ready)
     {
-        set_note(s, "slGetNewFrameToken failed on the endpoint frame.");
+        bridge.state.store(BridgeSlotState::free, std::memory_order_release);
+        set_note(s, "slGetNewFrameToken failed on the dedicated FG thread.");
         return false;
     }
 
@@ -1278,11 +1510,6 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
         s.last_reflex_options = (*g_reflex_set_options)(reflex);
         s.reflex_enabled = s.last_reflex_options == sl::Result::eOk;
     }
-
-    // Do not call slReflexSleep here. ReShade gives us the frame at presentation time, while
-    // NVIDIA's reference integration calls Sleep at simulation start. Sleeping at the end of the
-    // frame in v0.4 turned Reflex pacing into an extra presentation stall. We keep Reflex enabled
-    // and publish the PCL cadence, but leave pacing to the game's own loop.
     s.reflex_sleep_called = false;
 
     bool markers_ok = true;
@@ -1290,30 +1517,28 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
     markers_ok &= emit_marker(sl::PCLMarker::eSimulationEnd, *token, s);
     markers_ok &= emit_marker(sl::PCLMarker::eRenderSubmitStart, *token, s);
 
-    // D3D12 command allocator lifetime is a CPU rule, so wait only if the three-frame ring has
-    // actually wrapped before the endpoint completed that old submission.
-    if (slot.completed_value && !wait_for_release_value(slot.completed_value))
-    {
-        set_hr(s, DXGI_ERROR_DEVICE_HUNG, "Timed out waiting to recycle a D3D12 endpoint command allocator.");
-        return false;
-    }
-
+    // A slot is only returned to FREE after its release fence has completed, so its allocator is
+    // guaranteed idle here. There is intentionally no CPU wait in the normal frame path.
     hr = slot.allocator->Reset();
     if (SUCCEEDED(hr))
         hr = g_command_list->Reset(slot.allocator.Get(), nullptr);
     if (FAILED(hr))
     {
-        set_hr(s, hr, "Failed to reset the D3D12 endpoint command list.");
+        bridge.state.store(BridgeSlotState::free, std::memory_order_release);
+        set_hr(s, hr, "Failed to reset the async D3D12 endpoint command list.");
         return false;
     }
 
-    // These three swapchain APIs are Streamline hooks and therefore intentionally use the proxy.
     const UINT back_index = g_proxy_swapchain->GetCurrentBackBufferIndex();
     ComPtr<ID3D12Resource> endpoint_backbuffer;
     hr = g_proxy_swapchain->GetBuffer(back_index, IID_PPV_ARGS(&endpoint_backbuffer));
-    if (FAILED(hr))
+    if (FAILED(hr) || !endpoint_backbuffer)
     {
-        set_hr(s, hr, "Streamline proxy swapchain GetBuffer failed.");
+        // Reset() put the shared command list into recording state; close it before abandoning
+        // this slot so the next frame can legally Reset() the list again.
+        g_command_list->Close();
+        bridge.state.store(BridgeSlotState::free, std::memory_order_release);
+        set_hr(s, FAILED(hr) ? hr : E_FAIL, "Streamline proxy swapchain GetBuffer failed on the FG thread.");
         return false;
     }
 
@@ -1337,17 +1562,23 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
     hr = g_command_list->Close();
     if (FAILED(hr))
     {
-        set_hr(s, hr, "Failed to close the D3D12 endpoint command list.");
+        bridge.state.store(BridgeSlotState::free, std::memory_order_release);
+        set_hr(s, hr, "Failed to close the async D3D12 endpoint command list.");
         return false;
     }
+
     ID3D12CommandList *lists[] = { g_command_list.Get() };
     g_native_queue12->ExecuteCommandLists(1, lists);
     markers_ok &= emit_marker(sl::PCLMarker::eRenderSubmitEnd, *token, s);
 
     sl::Resource mv_res(sl::ResourceType::eTex2d, bridge.mv.d12.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
-    mv_res.width = mdesc.Width; mv_res.height = mdesc.Height; mv_res.nativeFormat = static_cast<uint32_t>(bridge.mv.format);
+    mv_res.width = mdesc.Width;
+    mv_res.height = mdesc.Height;
+    mv_res.nativeFormat = static_cast<uint32_t>(bridge.mv.format);
     sl::Resource depth_res(sl::ResourceType::eTex2d, bridge.depth.d12.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
-    depth_res.width = ddesc.Width; depth_res.height = ddesc.Height; depth_res.nativeFormat = static_cast<uint32_t>(bridge.depth.format);
+    depth_res.width = ddesc.Width;
+    depth_res.height = ddesc.Height;
+    depth_res.nativeFormat = static_cast<uint32_t>(bridge.depth.format);
 
     const sl::Extent mv_extent{0, 0, mdesc.Width, mdesc.Height};
     const sl::Extent depth_extent{0, 0, ddesc.Width, ddesc.Height};
@@ -1358,10 +1589,24 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
     s.last_set_tags = (*g_set_tag_for_frame)(*token, k_viewport, tags,
                                               static_cast<uint32_t>(sizeof(tags) / sizeof(tags[0])), nullptr);
     s.tags_submitted = s.last_set_tags == sl::Result::eOk;
+    if (!s.tags_submitted)
+    {
+        retire_bridge_slot(slot_index, s);
+        g_reset_next_capture.store(true, std::memory_order_release);
+        set_note(s, "Streamline rejected the async DLSS-G resource tags.");
+        return false;
+    }
 
-    const sl::Constants constants = make_test_constants(mdesc.Width, mdesc.Height, cdesc.Width, cdesc.Height);
+    const sl::Constants constants = make_test_constants(mdesc.Width, mdesc.Height, cdesc.Width, cdesc.Height, bridge.reset_history);
     s.last_set_constants = (*g_set_constants)(constants, *token, k_viewport);
     s.constants_submitted = s.last_set_constants == sl::Result::eOk;
+    if (!s.constants_submitted)
+    {
+        retire_bridge_slot(slot_index, s);
+        g_reset_next_capture.store(true, std::memory_order_release);
+        set_note(s, "Streamline rejected the async DLSS-G common constants.");
+        return false;
+    }
 
     sl::DLSSGOptions options{};
     options.mode = sl::DLSSGMode::eOn;
@@ -1376,39 +1621,32 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
     options.depthBufferFormat = static_cast<uint32_t>(bridge.depth.format);
     options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
     options.enableUserInterfaceRecomposition = sl::Boolean::eFalse;
-
     if (s.max_generated_frames > 0)
         options.numFramesToGenerate = std::min(options.numFramesToGenerate, s.max_generated_frames);
+
+    // SetOptions and Present now run on the SAME dedicated thread, matching Streamline's ordering
+    // requirement and avoiding the nested Present which killed v0.6 immediately after feature 11.
     s.last_set_options = (*g_set_options)(k_viewport, options);
     if (s.last_set_options != sl::Result::eOk)
     {
-        set_note(s, "slDLSSGSetOptions rejected the endpoint frame.");
+        retire_bridge_slot(slot_index, s);
+        g_reset_next_capture.store(true, std::memory_order_release);
+        set_note(s, "slDLSSGSetOptions rejected the dedicated-thread endpoint frame.");
         return false;
     }
 
     markers_ok &= emit_marker(sl::PCLMarker::ePresentStart, *token, s);
     s.pcl_markers_submitted = markers_ok;
-
-    align_endpoint_window(true);
     const UINT present_flags = g_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
     s.endpoint_present_attempted = true;
     s.last_present_hr = g_proxy_swapchain->Present(0, present_flags);
     s.endpoint_present_succeeded = SUCCEEDED(s.last_present_hr);
-
     markers_ok &= emit_marker(sl::PCLMarker::ePresentEnd, *token, s);
     s.pcl_markers_submitted = markers_ok;
-    g_dlssg_was_enabled = true;
+    g_dlssg_was_enabled = s.endpoint_present_succeeded;
 
-    if (!s.endpoint_present_succeeded)
-    {
-        set_hr(s, s.last_present_hr, "Streamline proxy Present failed.");
-        return false;
-    }
-
-    // Critical lifetime fix: these inputs are modified by the D3D11 game queue, which is NOT the
-    // endpoint presenting queue. NVIDIA explicitly exposes a completion fence/value for this case.
-    // Chain that internal fence onto our D3D12 queue, then signal the shared release fence that the
-    // D3D11 side uses before recycling this ring slot.
+    // Query state on the presenting thread. If NVIDIA provides an explicit input-consumption
+    // fence, chain it onto our native queue before releasing this ring slot back to D3D11.
     sl::DLSSGState present_state{};
     s.last_get_state = (*g_get_state)(k_viewport, present_state, nullptr);
     s.state_queried = true;
@@ -1418,7 +1656,7 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
         s.max_generated_frames = present_state.numFramesToGenerateMax;
         s.dynamic_mfg_supported = present_state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
         s.frames_presented_last_poll = present_state.numFramesActuallyPresented;
-        g_dlssg_presents_since_poll += present_state.numFramesActuallyPresented;
+        update_worker_fps(s, present_state);
 
         if (present_state.inputsProcessingCompletionFence != nullptr &&
             present_state.lastPresentInputsProcessingCompletionFenceValue != 0)
@@ -1428,25 +1666,157 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
                                         present_state.lastPresentInputsProcessingCompletionFenceValue);
             if (FAILED(hr))
             {
-                set_hr(s, hr, "Endpoint queue failed to wait for DLSS-G input-consumption completion.");
+                set_hr(s, hr, "FG worker failed to wait for NVIDIA input-consumption completion.");
                 return false;
             }
         }
     }
 
-    const uint64_t release_value = ++g_release_fence_value;
-    hr = g_native_queue12->Signal(g_release_fence12.Get(), release_value);
-    if (FAILED(hr))
+    if (!retire_bridge_slot(slot_index, s))
+        return false;
+
+    if (!s.endpoint_present_succeeded)
     {
-        set_hr(s, hr, "Failed to signal safe reuse of the frame-bridge slot.");
+        set_hr(s, s.last_present_hr, "Streamline proxy Present failed on the dedicated FG thread.");
         return false;
     }
-    bridge.release_value = release_value;
-    slot.completed_value = release_value;
-    g_first_endpoint_frame = false;
 
-    set_note(s, "DLSS-G ACTIVE: isolated endpoint + three-frame bridge + NVIDIA input-lifetime synchronization.");
+    set_note(s, "DLSS-G ACTIVE: dedicated Present thread, non-blocking game capture, native D3D12 endpoint.");
     return true;
+}
+
+void disable_dlssg_on_worker(Snapshot &s)
+{
+    drop_queued_bridge_slots();
+    if (!g_dlssg_was_enabled || !g_set_options)
+        return;
+
+    sl::DLSSGOptions off{};
+    off.mode = sl::DLSSGMode::eOff;
+    s.last_set_options = (*g_set_options)(k_viewport, off);
+    g_dlssg_was_enabled = false;
+}
+
+DWORD WINAPI fg_worker_thread_proc(LPVOID)
+{
+    g_fg_worker_running.store(true, std::memory_order_release);
+
+    while (!g_fg_worker_stop.load(std::memory_order_acquire))
+    {
+        if (g_fg_worker_wake == nullptr)
+            break;
+        const DWORD wait = WaitForSingleObject(g_fg_worker_wake, INFINITE);
+        if (wait != WAIT_OBJECT_0)
+            break;
+        if (g_fg_worker_stop.load(std::memory_order_acquire))
+            break;
+
+        Snapshot s = snapshot();
+        if (!requested_enabled())
+        {
+            disable_dlssg_on_worker(s);
+            std::lock_guard lock(g_state_mutex);
+            g_state = s;
+            continue;
+        }
+
+        for (;;)
+        {
+            const int slot_index = acquire_queued_bridge_slot();
+            if (slot_index < 0)
+                break;
+
+            g_fg_worker_busy.store(true, std::memory_order_release);
+            process_bridge_slot_on_worker(static_cast<uint32_t>(slot_index), s);
+            g_fg_worker_busy.store(false, std::memory_order_release);
+            reclaim_completed_bridge_slots();
+
+            if (!requested_enabled() || g_fg_worker_stop.load(std::memory_order_acquire))
+                break;
+        }
+
+        if (!requested_enabled())
+            disable_dlssg_on_worker(s);
+
+        std::lock_guard lock(g_state_mutex);
+        g_state = s;
+    }
+
+    // Disable on the same thread that owned SetOptions/Present before exiting whenever possible.
+    Snapshot final_state = snapshot();
+    disable_dlssg_on_worker(final_state);
+    {
+        std::lock_guard lock(g_state_mutex);
+        g_state = final_state;
+    }
+
+    g_fg_worker_busy.store(false, std::memory_order_release);
+    g_fg_worker_running.store(false, std::memory_order_release);
+    return 0;
+}
+
+bool ensure_fg_worker_started(Snapshot &s)
+{
+    if (g_fg_worker_handle != nullptr)
+        return true;
+
+    if (g_fg_worker_wake == nullptr)
+        g_fg_worker_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_fg_worker_wake == nullptr)
+    {
+        set_hr(s, HRESULT_FROM_WIN32(GetLastError()), "Could not create the FG worker wake event.");
+        return false;
+    }
+
+    g_fg_worker_stop.store(false, std::memory_order_release);
+    g_fg_worker_handle = CreateThread(nullptr, 0, &fg_worker_thread_proc, nullptr, 0, &g_fg_worker_id);
+    if (g_fg_worker_handle == nullptr)
+    {
+        set_hr(s, HRESULT_FROM_WIN32(GetLastError()), "Could not start the dedicated FG Present thread.");
+        return false;
+    }
+
+    set_note(s, "Dedicated FG Present thread started; game Present will only enqueue completed NR frames.");
+    return true;
+}
+
+void stop_fg_worker()
+{
+    g_requested_enabled.store(false, std::memory_order_release);
+    g_fg_worker_stop.store(true, std::memory_order_release);
+    if (g_fg_worker_wake)
+        SetEvent(g_fg_worker_wake);
+
+    bool worker_stopped = true;
+    if (g_fg_worker_handle)
+    {
+        // This runs from ReShade's runtime-destroy event, not DllMain, so waiting here is safe.
+        const DWORD wait = WaitForSingleObject(g_fg_worker_handle, 5000);
+        worker_stopped = wait == WAIT_OBJECT_0;
+        if (worker_stopped)
+        {
+            CloseHandle(g_fg_worker_handle);
+            g_fg_worker_handle = nullptr;
+            g_fg_worker_id = 0;
+        }
+        else
+        {
+            reshade::log::message(reshade::log::level::warning,
+                                  "[ReShadeFrameGen] FG worker did not stop within 5 seconds; leaving its handles intact rather than unloading underneath it.");
+        }
+    }
+    if (worker_stopped && g_fg_worker_wake)
+    {
+        CloseHandle(g_fg_worker_wake);
+        g_fg_worker_wake = nullptr;
+    }
+
+    drop_queued_bridge_slots();
+    if (worker_stopped)
+    {
+        g_fg_worker_running.store(false, std::memory_order_release);
+        g_fg_worker_busy.store(false, std::memory_order_release);
+    }
 }
 
 void refresh_state(Snapshot &s)
@@ -1466,38 +1836,6 @@ void refresh_state(Snapshot &s)
         query_requirements(s);
     if (s.endpoint_device_submitted)
         resolve_feature_functions(s);
-}
-
-void poll_state(Snapshot &s)
-{
-    if (!g_get_state || !s.feature_functions_ready)
-        return;
-
-    const ULONGLONG now = GetTickCount64();
-    if (g_last_poll_ms != 0 && now - g_last_poll_ms < 500)
-        return;
-
-    const double seconds = g_last_poll_ms == 0 ? 0.0 : static_cast<double>(now - g_last_poll_ms) / 1000.0;
-    g_last_poll_ms = now;
-
-    sl::DLSSGState state{};
-    s.last_get_state = (*g_get_state)(k_viewport, state, nullptr);
-    s.state_queried = true;
-    if (s.last_get_state == sl::Result::eOk)
-    {
-        s.status = state.status;
-        s.max_generated_frames = state.numFramesToGenerateMax;
-        s.frames_presented_last_poll = state.numFramesActuallyPresented;
-        s.dynamic_mfg_supported = state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
-        g_dlssg_presents_since_poll += state.numFramesActuallyPresented;
-        if (seconds > 0.0)
-        {
-            s.output_fps = static_cast<double>(g_dlssg_presents_since_poll) / seconds;
-            s.app_present_fps = static_cast<double>(g_app_presents_since_poll) / seconds;
-        }
-    }
-    g_app_presents_since_poll = 0;
-    g_dlssg_presents_since_poll = 0;
 }
 
 void hide_endpoint()
@@ -1561,6 +1899,10 @@ void on_primary_runtime_destroyed(reshade::api::effect_runtime *runtime)
 {
     if (runtime && static_cast<HWND>(runtime->get_hwnd()) != g_game_hwnd)
         return;
+
+    // Stop/join outside DllMain while ReShade's runtime is still alive. This guarantees the
+    // dedicated Present thread cannot outlive the add-on or touch an endpoint being destroyed.
+    stop_fg_worker();
     g_game_hwnd = nullptr;
     hide_endpoint();
 }
@@ -1572,9 +1914,16 @@ void set_game_api(reshade::api::device_api api)
 
 void request_enabled(bool enabled)
 {
-    g_requested_enabled.store(enabled, std::memory_order_relaxed);
+    const bool previous = g_requested_enabled.exchange(enabled, std::memory_order_acq_rel);
+    if (enabled && !previous)
+    {
+        g_reset_next_capture.store(true, std::memory_order_release);
+        g_reset_fps_counters.store(true, std::memory_order_release);
+    }
     if (!enabled)
         hide_endpoint();
+    if (g_fg_worker_wake)
+        SetEvent(g_fg_worker_wake);
 }
 
 void request_multiplier(int multiplier)
@@ -1585,7 +1934,7 @@ void request_multiplier(int multiplier)
 void request_depth_inverted(bool inverted)
 {
     g_depth_inverted.store(inverted, std::memory_order_relaxed);
-    g_first_endpoint_frame = true;
+    g_reset_next_capture.store(true, std::memory_order_release);
 }
 
 bool requested_enabled() { return g_requested_enabled.load(std::memory_order_relaxed); }
@@ -1594,10 +1943,10 @@ bool requested_depth_inverted() { return g_depth_inverted.load(std::memory_order
 
 void present_tick(reshade::api::effect_runtime *runtime)
 {
-    ++g_app_presents_since_poll;
+    g_app_presents_since_poll.fetch_add(1, std::memory_order_relaxed);
     pump_endpoint_messages();
+    reclaim_completed_bridge_slots();
 
-    // F6 is intentionally available even while the endpoint window covers the game's ReShade UI.
     if ((GetAsyncKeyState(VK_F6) & 1) != 0)
         request_enabled(!requested_enabled());
 
@@ -1609,15 +1958,13 @@ void present_tick(reshade::api::effect_runtime *runtime)
         refresh_state(s);
     }
 
-    // Keep driving endpoint construction until every object needed for an actual Present exists.
-    // The old one-shot path could get stuck forever after a single interop failure.
     if (runtime && runtime->get_device() && runtime->get_device()->get_api() == reshade::api::device_api::d3d11 &&
         s.streamline_initialized)
     {
         const bool endpoint_setup_incomplete =
             !s.endpoint_device_submitted || !s.feature_loaded || !s.feature_functions_ready ||
             !s.proxy_device_ready || !s.proxy_queue_ready || !s.native_queue_resolved || !s.proxy_factory_ready ||
-            !g_command_list || !g_input_fence12 || !g_input_fence11 || !g_release_fence12 || !g_release_fence11 || !g_game_context11_4;
+            !g_command_list || !g_input_fence12 || !g_input_fence11 || !g_release_fence12 || !g_game_context11_4;
 
         if (endpoint_setup_incomplete)
         {
@@ -1630,11 +1977,12 @@ void present_tick(reshade::api::effect_runtime *runtime)
         }
     }
 
+    bool queued_frame = false;
     if (runtime && runtime->get_device() && runtime->get_device()->get_api() == reshade::api::device_api::d3d11 &&
         s.endpoint_device_submitted && s.feature_loaded && s.feature_functions_ready)
     {
-        // Build the bridge/swapchain even while disabled so the UI can reach READY before the user
-        // presses F6. The expensive per-frame copy/tag/Present happens only when enabled.
+        // Resolve/build resources on the game thread, but only while no worker-owned slot would be
+        // destroyed. Once READY, the callback never performs a Streamline feature call or Present.
         guides::NativeTextures guide{};
         const guides::Snapshot guide_state = guides::snapshot();
         const bool guides_ok = guide_state.effect_enabled && guides::acquire_native_textures(runtime, guide);
@@ -1644,48 +1992,43 @@ void present_tick(reshade::api::effect_runtime *runtime)
             set_note(s, "DLSS5_Feed.fx is installed but disabled. Enable its DLSS5_Feed technique so MV/depth update every frame.");
 
         const reshade::api::resource bb = runtime->get_current_back_buffer();
-        ID3D11Texture2D *color = bb.handle ? reinterpret_cast<ID3D11Texture2D *>(static_cast<uintptr_t>(bb.handle)) : nullptr;
+        auto *color = bb.handle ? reinterpret_cast<ID3D11Texture2D *>(static_cast<uintptr_t>(bb.handle)) : nullptr;
         if (guides_ok && color)
             ensure_frame_bridge(color, guide.motion_vectors, guide.depth, s);
 
         s.controller_ready = s.streamline_initialized && s.endpoint_device_submitted && s.endpoint_feature_supported &&
                              s.feature_loaded && s.proxy_device_ready && s.proxy_queue_ready && s.native_queue_resolved && s.proxy_factory_ready &&
-                             s.proxy_swapchain_ready && s.feeder_bridge_ready &&
-                             guide_state.effect_enabled && s.feature_functions_ready &&
-                             s.reflex_functions_ready && s.pcl_functions_ready &&
-                             g_command_list && g_input_fence12 && g_input_fence11 && g_release_fence12 && g_release_fence11 && g_game_context11_4;
+                             s.proxy_swapchain_ready && s.feeder_bridge_ready && guide_state.effect_enabled &&
+                             s.feature_functions_ready && s.reflex_functions_ready && s.pcl_functions_ready &&
+                             g_command_list && g_input_fence12 && g_input_fence11 && g_release_fence12 && g_game_context11_4;
 
-        if (requested_enabled() && s.controller_ready)
-        {
-            // DLSS5-Feeder is allowed to remain loaded. The host consumes the guide textures from
-            // DLSS5_Feed.fx while keeping this private FG presentation runtime isolated from the
-            // normal ReShade effect stack. Do not infer a conflict merely from the Feeder module
-            // being present; its NGX/DLAA path is a separate, user-selected workload.
-            submit_real_frame(runtime, s);
-        }
-        else
-        {
-            // F6 is an actual escape hatch: tell DLSS-G to turn off before hiding the endpoint.
-            // Defer this to the present thread instead of calling feature APIs from the UI callback.
-            if (!requested_enabled() && g_dlssg_was_enabled && g_set_options)
-            {
-                sl::DLSSGOptions off{};
-                off.mode = sl::DLSSGMode::eOff;
-                s.last_set_options = (*g_set_options)(k_viewport, off);
-                g_dlssg_was_enabled = false;
-            }
-            hide_endpoint();
-        }
+        if (s.controller_ready)
+            ensure_fg_worker_started(s);
+
+        if (requested_enabled() && s.controller_ready && g_fg_worker_handle != nullptr)
+            queued_frame = capture_real_frame_nonblocking(runtime, s);
+
+        // Do not cover the game with the utility window until the worker has completed at least one
+        // successful endpoint Present. Window positioning remains on the game's UI thread.
+        align_endpoint_window(requested_enabled() && s.endpoint_present_succeeded);
     }
     else
     {
         hide_endpoint();
     }
 
-    poll_state(s);
+    if (!requested_enabled())
+        hide_endpoint();
 
-    std::lock_guard lock(g_state_mutex);
-    g_state = s;
+    // Publish the game-thread state BEFORE waking the worker, so a fast FG Present cannot be
+    // immediately overwritten by a stale pre-submit snapshot from this callback.
+    {
+        std::lock_guard lock(g_state_mutex);
+        g_state = s;
+    }
+
+    if (queued_frame && g_fg_worker_wake)
+        SetEvent(g_fg_worker_wake);
 }
 
 void force_reprobe()

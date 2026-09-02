@@ -17,10 +17,10 @@
 #include "feeder_probe.hpp"
 #include "streamline_host.hpp"
 
-extern "C" __declspec(dllexport) const char *NAME = "ReShade FrameGen - DLSS-G Host 0.6";
+extern "C" __declspec(dllexport) const char *NAME = "ReShade FrameGen - DLSS-G Host 0.7";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "NVIDIA DLSS-G frame-generation host for D3D11 games. Uses DLSS5_Feed motion/depth, "
-    "keeps the private Streamline presentation swapchain outside ReShade runtimes, and presents through DLSS-G.";
+    "NVIDIA DLSS-G frame-generation host for D3D11 games. Captures the final Feeder/NR frame "
+    "non-blocking and presents DLSS-G from a dedicated native-D3D12 worker thread.";
 
 namespace
 {
