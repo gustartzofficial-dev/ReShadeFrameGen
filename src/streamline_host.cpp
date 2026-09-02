@@ -77,7 +77,7 @@ uint32_t g_frame_index = 0;
 std::atomic_bool g_reset_next_capture{true};
 bool g_dlssg_was_enabled = false;
 
-// v0.7 never calls Streamline/DXGI Present from inside ReShade's reshade_present callback.
+// v0.8 never calls Streamline/DXGI Present from inside ReShade's reshade_present callback.
 // The game thread only copies the completed NR frame into a free bridge slot and signals an
 // input fence. A dedicated worker owns frame tokens, DLSS-G calls and the private swapchain.
 std::atomic_bool g_fg_worker_stop{false};
@@ -88,6 +88,9 @@ HANDLE g_fg_worker_wake = nullptr;
 DWORD g_fg_worker_id = 0;
 std::atomic<uint64_t> g_enqueued_frames{0};
 std::atomic<uint64_t> g_dropped_frames{0};
+// DLSS-G invokes this from the Present thread for asynchronous DXGI errors. Keep the
+// callback lock-free and consume the HRESULT after Present returns.
+std::atomic<long> g_last_dlssg_api_error{S_OK};
 
 std::wstring g_plugin_dir;
 std::array<const wchar_t *, 1> g_plugin_paths{};
@@ -98,7 +101,7 @@ constexpr std::array<sl::Feature, 3> k_requested_features = {
 };
 
 constexpr const char *k_project_id = "68c3c204-a7b9-43e0-a319-37b62eef12f7";
-constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.7-AsyncPresent";
+constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.8-SafeContract";
 const sl::ViewportHandle k_viewport{0};
 
 // The private endpoint is deliberately created with the real system DLLs rather than the game's
@@ -112,7 +115,7 @@ D3D12CreateDeviceProc g_d3d12_create_device = nullptr;
 CreateDXGIFactory2Proc g_create_dxgi_factory2 = nullptr;
 
 // ReShade D3D/DXGI proxies expose their original COM object through this private IID.
-// v0.7 unwraps BOTH the private D3D12 device and the factory before giving them to Streamline.
+// v0.8 unwraps BOTH the private D3D12 device and the factory before giving them to Streamline.
 // RenoDX does not need a ReShade wrapper around this FG-only device: its NGX detours are process
 // wide and the v0.6 log already proved it sees feature 11. Keeping a single native identity here
 // avoids proxy-on-proxy command queues/resources while the game's Feeder/NR device remains intact.
@@ -135,19 +138,23 @@ ComPtr<IDXGIFactory4> g_proxy_factory;
 ComPtr<IDXGISwapChain3> g_proxy_swapchain;
 ComPtr<IDXGISwapChain3> g_native_swapchain;
 
-constexpr uint32_t k_frame_ring_size = 3;
+constexpr uint32_t k_frame_ring_size = 1;
 
 struct CommandSlot
 {
     ComPtr<ID3D12CommandAllocator> allocator;
+    // Separate post-Present list. It is queued only after NVIDIA has finished consuming
+    // MV/depth and returns the shared guide resources to COMMON before D3D11 can reuse them.
+    ComPtr<ID3D12CommandAllocator> release_allocator;
+    ComPtr<ID3D12GraphicsCommandList> release_list;
     uint64_t completed_value = 0;
 };
 std::array<CommandSlot, k_frame_ring_size> g_command_slots{};
 ComPtr<ID3D12GraphicsCommandList> g_command_list;
 
-// Once more than one frame can be in flight the cross-API synchronization must be directional.
-// D3D11 signals input readiness; D3D12 signals safe reuse. A single bidirectional timeline can
-// jump over an older completion value and was one of v0.4's unsafe assumptions.
+// Cross-API synchronization stays directional even in the single-flight baseline.
+// D3D11 signals input readiness; D3D12 signals safe reuse. Keeping independent timelines avoids
+// the bidirectional-fence ordering mistake from the early prototypes.
 ComPtr<ID3D12Fence> g_input_fence12;
 ComPtr<ID3D11Fence> g_input_fence11;
 ComPtr<ID3D12Fence> g_release_fence12;
@@ -353,6 +360,11 @@ DXGI_FORMAT g_endpoint_format = DXGI_FORMAT_UNKNOWN;
 uint32_t g_endpoint_backbuffer_count = 0;
 bool g_allow_tearing = false;
 
+void on_dlssg_api_error(const sl::APIError &error)
+{
+    g_last_dlssg_api_error.store(static_cast<long>(error.hres), std::memory_order_release);
+}
+
 void set_note(Snapshot &s, const char *note)
 {
     const std::string next = note != nullptr ? note : "";
@@ -544,7 +556,7 @@ bool perform_bootstrap(bool early_device_creation)
     resolve_core_exports(module, s);
     if (!s.core_exports_ready)
     {
-        set_note(s, "sl.interposer.dll loaded, but v0.7 could not resolve the manual-hooking/frame-tagging exports it needs.");
+        set_note(s, "sl.interposer.dll loaded, but v0.8 could not resolve the manual-hooking/frame-tagging exports it needs.");
         std::lock_guard lock(g_state_mutex);
         g_state = s;
         return false;
@@ -590,11 +602,11 @@ bool perform_bootstrap(bool early_device_creation)
         }
 
         query_requirements(s);
-        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.7 can create the same-adapter D3D12 endpoint.");
+        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.8 can create the same-adapter D3D12 endpoint.");
     }
     else if (!early_device_creation)
     {
-        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.7 never calls slInit a second time late.");
+        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.8 never calls slInit a second time late.");
     }
 
     std::lock_guard lock(g_state_mutex);
@@ -722,7 +734,7 @@ void destroy_swapchain()
 void destroy_bridge_resources()
 {
     // Resource destruction is rare (resize/shutdown), so it is fine to drain here. Normal frame
-    // reuse is handled by a three-deep ring and never waits on the immediately previous frame.
+    // reuse is handled by a single-flight bridge and never waits on the immediately previous frame.
     for (auto &slot : g_bridge_slots)
     {
         if (slot.release_value != 0)
@@ -895,7 +907,8 @@ bool create_shared_fences(Snapshot &s)
 
 bool create_command_objects(Snapshot &s)
 {
-    if (g_command_list && g_command_slots[0].allocator)
+    if (g_command_list && g_command_slots[0].allocator &&
+        g_command_slots[0].release_allocator && g_command_slots[0].release_list)
         return true;
     if (!g_device12)
         return false;
@@ -908,6 +921,23 @@ bool create_command_objects(Snapshot &s)
             set_hr(s, hr, "Failed to create a D3D12 command allocator for the endpoint.");
             return false;
         }
+
+        hr = g_device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.release_allocator));
+        if (FAILED(hr))
+        {
+            set_hr(s, hr, "Failed to create the D3D12 guide-release allocator.");
+            return false;
+        }
+
+        hr = g_device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                           slot.release_allocator.Get(), nullptr,
+                                           IID_PPV_ARGS(&slot.release_list));
+        if (FAILED(hr))
+        {
+            set_hr(s, hr, "Failed to create the D3D12 guide-release command list.");
+            return false;
+        }
+        slot.release_list->Close();
     }
 
     HRESULT hr = g_device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -1255,7 +1285,7 @@ bool ensure_frame_bridge(ID3D11Texture2D *game_color, ID3D11Texture2D *mv, ID3D1
 
     if (cdesc.SampleDesc.Count != 1 || mdesc.SampleDesc.Count != 1 || ddesc.SampleDesc.Count != 1)
     {
-        set_note(s, "v0.7 requires single-sample color/MV/depth textures.");
+        set_note(s, "v0.8 requires single-sample color/MV/depth textures.");
         return false;
     }
 
@@ -1299,7 +1329,7 @@ bool ensure_frame_bridge(ID3D11Texture2D *game_color, ID3D11Texture2D *mv, ID3D1
     s.feeder_bridge_ready = true;
     s.endpoint_hr = S_OK;
     if (became_ready)
-        set_note(s, "Async three-frame bridge ready. DLSS-G can now be enabled.");
+        set_note(s, "Single-flight bridge ready. DLSS-G can now be enabled.");
     return true;
 }
 
@@ -1319,6 +1349,9 @@ sl::Constants make_test_constants(uint32_t mv_width, uint32_t mv_height, uint32_
     set_identity(c.clipToPrevClip);
     set_identity(c.prevClipToClip);
     c.jitterOffset = sl::float2(0.f, 0.f);
+    // Although documented as optional, Streamline's common validator warns if this is left
+    // at INVALID_FLOAT. The Feeder path does not use a pinhole offset.
+    c.cameraPinholeOffset = sl::float2(0.f, 0.f);
     c.mvecScale = sl::float2(mv_width ? 1.0f / static_cast<float>(mv_width) : 1.0f,
                              mv_height ? 1.0f / static_cast<float>(mv_height) : 1.0f);
     c.cameraPos = sl::float3(0.f, 0.f, 0.f);
@@ -1373,8 +1406,9 @@ bool capture_real_frame_nonblocking(reshade::api::effect_runtime *runtime, Snaps
     const int slot_index = acquire_free_bridge_slot();
     if (slot_index < 0)
     {
-        // Backpressure policy for v0.7: never stall the game/NR pipeline for frame generation.
-        // If the worker is three frames behind, simply skip this FG input and try again next frame.
+        // Backpressure policy for v0.8: keep exactly one FG frame in flight until we have
+        // proven the complete resource-state/lifetime contract stable. Never stall the game/NR
+        // pipeline; simply skip this FG input and try again next frame.
         g_dropped_frames.fetch_add(1, std::memory_order_relaxed);
         g_reset_next_capture.store(true, std::memory_order_release);
         return false;
@@ -1414,13 +1448,45 @@ bool retire_bridge_slot(uint32_t slot_index, Snapshot &s)
     BridgeSlot &bridge = g_bridge_slots[slot_index];
     CommandSlot &slot = g_command_slots[slot_index];
 
-    const uint64_t release_value = ++g_release_fence_value;
-    const HRESULT hr = g_native_queue12->Signal(g_release_fence12.Get(), release_value);
+    // Streamline consumed the guides in NON_PIXEL_SHADER_RESOURCE. Before the shared allocation
+    // can cross back to D3D11, explicitly restore it to COMMON. This mirrors DLSS5-Feeder's
+    // proven D3D11<->D3D12 contract instead of assuming a third-party feature restores states.
+    HRESULT hr = slot.release_allocator->Reset();
+    if (SUCCEEDED(hr))
+        hr = slot.release_list->Reset(slot.release_allocator.Get(), nullptr);
     if (FAILED(hr))
     {
-        // Do not make this slot reusable when queue ordering itself failed. A device-removed path
-        // is safer than letting D3D11 overwrite memory which the endpoint might still reference.
-        set_hr(s, hr, "Failed to signal safe reuse of an async frame-bridge slot.");
+        set_hr(s, hr, "Failed to reset the D3D12 guide-release command list.");
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER release_barriers[2]{};
+    release_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    release_barriers[0].Transition.pResource = bridge.mv.d12.Get();
+    release_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    release_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    release_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    release_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    release_barriers[1].Transition.pResource = bridge.depth.d12.Get();
+    release_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    release_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    release_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    slot.release_list->ResourceBarrier(2, release_barriers);
+
+    hr = slot.release_list->Close();
+    if (FAILED(hr))
+    {
+        set_hr(s, hr, "Failed to close the D3D12 guide-release command list.");
+        return false;
+    }
+    ID3D12CommandList *release_lists[] = { slot.release_list.Get() };
+    g_native_queue12->ExecuteCommandLists(1, release_lists);
+
+    const uint64_t release_value = ++g_release_fence_value;
+    hr = g_native_queue12->Signal(g_release_fence12.Get(), release_value);
+    if (FAILED(hr))
+    {
+        set_hr(s, hr, "Failed to signal safe reuse of the single-flight frame bridge.");
         return false;
     }
 
@@ -1542,22 +1608,34 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
         return false;
     }
 
-    D3D12_RESOURCE_BARRIER barriers[2]{};
-    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barriers[0].Transition.pResource = bridge.color.d12.Get();
-    barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barriers[1].Transition.pResource = endpoint_backbuffer.Get();
-    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    g_command_list->ResourceBarrier(2, barriers);
+    D3D12_RESOURCE_BARRIER begin_barriers[4]{};
+    begin_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    begin_barriers[0].Transition.pResource = bridge.color.d12.Get();
+    begin_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    begin_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    begin_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    begin_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    begin_barriers[1].Transition.pResource = endpoint_backbuffer.Get();
+    begin_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    begin_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    begin_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    begin_barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    begin_barriers[2].Transition.pResource = bridge.mv.d12.Get();
+    begin_barriers[2].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    begin_barriers[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    begin_barriers[2].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    begin_barriers[3].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    begin_barriers[3].Transition.pResource = bridge.depth.d12.Get();
+    begin_barriers[3].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    begin_barriers[3].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    begin_barriers[3].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    g_command_list->ResourceBarrier(4, begin_barriers);
     g_command_list->CopyResource(endpoint_backbuffer.Get(), bridge.color.d12.Get());
-    std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
-    std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
-    g_command_list->ResourceBarrier(2, barriers);
+
+    D3D12_RESOURCE_BARRIER end_barriers[2] = { begin_barriers[0], begin_barriers[1] };
+    std::swap(end_barriers[0].Transition.StateBefore, end_barriers[0].Transition.StateAfter);
+    std::swap(end_barriers[1].Transition.StateBefore, end_barriers[1].Transition.StateAfter);
+    g_command_list->ResourceBarrier(2, end_barriers);
 
     hr = g_command_list->Close();
     if (FAILED(hr))
@@ -1571,11 +1649,11 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
     g_native_queue12->ExecuteCommandLists(1, lists);
     markers_ok &= emit_marker(sl::PCLMarker::eRenderSubmitEnd, *token, s);
 
-    sl::Resource mv_res(sl::ResourceType::eTex2d, bridge.mv.d12.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
+    sl::Resource mv_res(sl::ResourceType::eTex2d, bridge.mv.d12.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
     mv_res.width = mdesc.Width;
     mv_res.height = mdesc.Height;
     mv_res.nativeFormat = static_cast<uint32_t>(bridge.mv.format);
-    sl::Resource depth_res(sl::ResourceType::eTex2d, bridge.depth.d12.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
+    sl::Resource depth_res(sl::ResourceType::eTex2d, bridge.depth.d12.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
     depth_res.width = ddesc.Width;
     depth_res.height = ddesc.Height;
     depth_res.nativeFormat = static_cast<uint32_t>(bridge.depth.format);
@@ -1611,21 +1689,16 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
     sl::DLSSGOptions options{};
     options.mode = sl::DLSSGMode::eOn;
     options.numFramesToGenerate = static_cast<uint32_t>(std::max(1, std::clamp(g_requested_multiplier.load(std::memory_order_relaxed), 2, 6) - 1));
-    options.numBackBuffers = g_endpoint_backbuffer_count != 0 ? g_endpoint_backbuffer_count : 3;
-    options.mvecDepthWidth = mdesc.Width;
-    options.mvecDepthHeight = mdesc.Height;
-    options.colorWidth = cdesc.Width;
-    options.colorHeight = cdesc.Height;
-    options.colorBufferFormat = static_cast<uint32_t>(g_endpoint_format);
-    options.mvecBufferFormat = static_cast<uint32_t>(bridge.mv.format);
-    options.depthBufferFormat = static_cast<uint32_t>(bridge.depth.format);
-    options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
-    options.enableUserInterfaceRecomposition = sl::Boolean::eFalse;
     if (s.max_generated_frames > 0)
         options.numFramesToGenerate = std::min(options.numFramesToGenerate, s.max_generated_frames);
+    // Everything below is intentionally left at the SDK defaults. numBackBuffers, dimensions and
+    // native formats are OPTIONAL hints; guessing them is worse than omitting them when DLSS-G is
+    // free to virtualize/replace parts of the presentation chain.
+    options.onErrorCallback = &on_dlssg_api_error;
 
-    // SetOptions and Present now run on the SAME dedicated thread, matching Streamline's ordering
-    // requirement and avoiding the nested Present which killed v0.6 immediately after feature 11.
+    // SetOptions and Present run on the SAME dedicated thread. Clear the asynchronous DXGI
+    // error latch before each submission so the callback can attribute an error to this Present.
+    g_last_dlssg_api_error.store(S_OK, std::memory_order_release);
     s.last_set_options = (*g_set_options)(k_viewport, options);
     if (s.last_set_options != sl::Result::eOk)
     {
@@ -1640,14 +1713,31 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
     const UINT present_flags = g_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
     s.endpoint_present_attempted = true;
     s.last_present_hr = g_proxy_swapchain->Present(0, present_flags);
-    s.endpoint_present_succeeded = SUCCEEDED(s.last_present_hr);
+    // Do not treat a positive DXGI status (for example an occlusion status) as a rendered frame.
+    s.endpoint_present_succeeded = s.last_present_hr == S_OK;
     markers_ok &= emit_marker(sl::PCLMarker::ePresentEnd, *token, s);
     s.pcl_markers_submitted = markers_ok;
     g_dlssg_was_enabled = s.endpoint_present_succeeded;
 
+    const HRESULT callback_hr = static_cast<HRESULT>(g_last_dlssg_api_error.load(std::memory_order_acquire));
+    const HRESULT removed_hr = g_device12 ? g_device12->GetDeviceRemovedReason() : S_OK;
+    if (FAILED(callback_hr) || FAILED(removed_hr))
+    {
+        // Restore the shared guide state before abandoning the slot, then stop submitting new FG
+        // work. This is an internal fail-safe, not another overlay diagnostic mode.
+        retire_bridge_slot(slot_index, s);
+        g_requested_enabled.store(false, std::memory_order_release);
+        g_dlssg_was_enabled = false;
+        set_hr(s, FAILED(removed_hr) ? removed_hr : callback_hr,
+               FAILED(removed_hr) ? "D3D12 device was removed during DLSS-G Present."
+                                  : "DLSS-G reported an asynchronous DXGI Present error.");
+        return false;
+    }
+
     // Query state on the presenting thread. If NVIDIA provides an explicit input-consumption
     // fence, chain it onto our native queue before releasing this ring slot back to D3D11.
     sl::DLSSGState present_state{};
+    bool bad_dlssg_status = false;
     s.last_get_state = (*g_get_state)(k_viewport, present_state, nullptr);
     s.state_queried = true;
     if (s.last_get_state == sl::Result::eOk)
@@ -1657,6 +1747,7 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
         s.dynamic_mfg_supported = present_state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
         s.frames_presented_last_poll = present_state.numFramesActuallyPresented;
         update_worker_fps(s, present_state);
+        bad_dlssg_status = present_state.status != sl::DLSSGStatus::eOk;
 
         if (present_state.inputsProcessingCompletionFence != nullptr &&
             present_state.lastPresentInputsProcessingCompletionFenceValue != 0)
@@ -1675,13 +1766,43 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
     if (!retire_bridge_slot(slot_index, s))
         return false;
 
-    if (!s.endpoint_present_succeeded)
+    // NVIDIA exposes contract failures through DLSSGState. Never submit a second frame after the
+    // plugin has already told us the first contract is invalid; stop safely instead of allowing
+    // an asynchronous GPU fault to cascade into the game process.
+    if (bad_dlssg_status)
     {
-        set_hr(s, s.last_present_hr, "Streamline proxy Present failed on the dedicated FG thread.");
+        g_requested_enabled.store(false, std::memory_order_release);
+        g_dlssg_was_enabled = false;
+        if (present_state.status & sl::DLSSGStatus::eFailCommonConstantsInvalid)
+            set_note(s, "DLSS-G rejected the common frame constants; Frame Generation was stopped safely.");
+        else if (present_state.status & sl::DLSSGStatus::eFailReflexNotDetectedAtRuntime)
+            set_note(s, "DLSS-G did not accept the Reflex frame cadence; Frame Generation was stopped safely.");
+        else if (present_state.status & sl::DLSSGStatus::eFailGetCurrentBackBufferIndexNotCalled)
+            set_note(s, "DLSS-G rejected the swapchain backbuffer-index contract; Frame Generation was stopped safely.");
+        else if (present_state.status & sl::DLSSGStatus::eFailHDRFormatNotSupported)
+            set_note(s, "DLSS-G rejected the endpoint color format; Frame Generation was stopped safely.");
+        else if (present_state.status & sl::DLSSGStatus::eFailResolutionTooLow)
+            set_note(s, "DLSS-G rejected the endpoint resolution; Frame Generation was stopped safely.");
+        else
+            set_note(s, "DLSS-G reported a non-OK frame contract; Frame Generation was stopped safely.");
         return false;
     }
 
-    set_note(s, "DLSS-G ACTIVE: dedicated Present thread, non-blocking game capture, native D3D12 endpoint.");
+    if (!s.endpoint_present_succeeded)
+    {
+        g_requested_enabled.store(false, std::memory_order_release);
+        g_dlssg_was_enabled = false;
+        if (FAILED(s.last_present_hr))
+            set_hr(s, s.last_present_hr, "Streamline proxy Present failed on the dedicated FG thread.");
+        else
+        {
+            s.endpoint_hr = s.last_present_hr;
+            set_note(s, "Streamline Present returned a non-S_OK DXGI status; Frame Generation was stopped safely.");
+        }
+        return false;
+    }
+
+    set_note(s, "DLSS-G ACTIVE: single-flight safe contract, explicit guide states, non-blocking game capture.");
     return true;
 }
 
@@ -2008,9 +2129,11 @@ void present_tick(reshade::api::effect_runtime *runtime)
         if (requested_enabled() && s.controller_ready && g_fg_worker_handle != nullptr)
             queued_frame = capture_real_frame_nonblocking(runtime, s);
 
-        // Do not cover the game with the utility window until the worker has completed at least one
-        // successful endpoint Present. Window positioning remains on the game's UI thread.
-        align_endpoint_window(requested_enabled() && s.endpoint_present_succeeded);
+        // The endpoint must already be visible before its first real Present. Previously we kept it
+        // hidden until Present "succeeded", which made the first CPU-side success an unreliable
+        // signal of an actually displayed/generated frame. Positioning remains on the game thread.
+        align_endpoint_window(requested_enabled() && s.controller_ready &&
+                              (queued_frame || s.endpoint_present_succeeded));
     }
     else
     {
