@@ -85,7 +85,7 @@ constexpr std::array<sl::Feature, 3> k_requested_features = {
 
 constexpr const char *k_project_id = "68c3c204-a7b9-43e0-a319-37b62eef12f7";
 constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.3-D3D12Endpoint";
-constexpr sl::ViewportHandle k_viewport{0};
+const sl::ViewportHandle k_viewport{0};
 
 // The private endpoint is deliberately created with the real system DLLs rather than the game's
 // proxy dxgi.dll. ReShade continues to own the game's D3D11 swapchain; Streamline owns this D3D12
