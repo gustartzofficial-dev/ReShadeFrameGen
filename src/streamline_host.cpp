@@ -71,6 +71,7 @@ Snapshot g_state{};
 ULONGLONG g_last_probe_ms = 0;
 ULONGLONG g_last_poll_ms = 0;
 uint64_t g_app_presents_since_poll = 0;
+uint64_t g_dlssg_presents_since_poll = 0;
 uint32_t g_frame_index = 0;
 bool g_first_endpoint_frame = true;
 bool g_dlssg_was_enabled = false;
@@ -84,7 +85,7 @@ constexpr std::array<sl::Feature, 3> k_requested_features = {
 };
 
 constexpr const char *k_project_id = "68c3c204-a7b9-43e0-a319-37b62eef12f7";
-constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.4-InteropFix";
+constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.5-StableRing";
 const sl::ViewportHandle k_viewport{0};
 
 // The private endpoint is deliberately created with the real system DLLs rather than the game's
@@ -113,19 +114,26 @@ ComPtr<IDXGIFactory4> g_proxy_factory;
 ComPtr<IDXGISwapChain3> g_proxy_swapchain;
 ComPtr<IDXGISwapChain3> g_native_swapchain;
 
+constexpr uint32_t k_frame_ring_size = 3;
+
 struct CommandSlot
 {
     ComPtr<ID3D12CommandAllocator> allocator;
     uint64_t completed_value = 0;
 };
-std::array<CommandSlot, 3> g_command_slots{};
+std::array<CommandSlot, k_frame_ring_size> g_command_slots{};
 ComPtr<ID3D12GraphicsCommandList> g_command_list;
 
-ComPtr<ID3D12Fence> g_shared_fence12;
-ComPtr<ID3D11Fence> g_shared_fence11;
-HANDLE g_fence_event = nullptr;
-uint64_t g_fence_value = 0;
-uint64_t g_last_endpoint_done = 0;
+// Once more than one frame can be in flight the cross-API synchronization must be directional.
+// D3D11 signals input readiness; D3D12 signals safe reuse. A single bidirectional timeline can
+// jump over an older completion value and was one of v0.4's unsafe assumptions.
+ComPtr<ID3D12Fence> g_input_fence12;
+ComPtr<ID3D11Fence> g_input_fence11;
+ComPtr<ID3D12Fence> g_release_fence12;
+ComPtr<ID3D11Fence> g_release_fence11;
+HANDLE g_release_fence_event = nullptr;
+uint64_t g_input_fence_value = 0;
+uint64_t g_release_fence_value = 0;
 
 std::mutex g_note_log_mutex;
 std::string g_last_logged_note;
@@ -186,9 +194,30 @@ struct SharedTexture
     }
 };
 
-SharedTexture g_shared_color;
-SharedTexture g_shared_mv;
-SharedTexture g_shared_depth;
+struct BridgeSlot
+{
+    SharedTexture color;
+    SharedTexture mv;
+    SharedTexture depth;
+    uint64_t release_value = 0;
+
+    bool matches(const D3D11_TEXTURE2D_DESC &color_desc,
+                 const D3D11_TEXTURE2D_DESC &mv_desc,
+                 const D3D11_TEXTURE2D_DESC &depth_desc) const
+    {
+        return color.matches(color_desc) && mv.matches(mv_desc) && depth.matches(depth_desc);
+    }
+
+    void reset()
+    {
+        color.reset();
+        mv.reset();
+        depth.reset();
+        release_value = 0;
+    }
+};
+
+std::array<BridgeSlot, k_frame_ring_size> g_bridge_slots{};
 
 HWND g_game_hwnd = nullptr;
 HWND g_endpoint_hwnd = nullptr;
@@ -196,6 +225,7 @@ ATOM g_window_class = 0;
 uint32_t g_endpoint_width = 0;
 uint32_t g_endpoint_height = 0;
 DXGI_FORMAT g_endpoint_format = DXGI_FORMAT_UNKNOWN;
+uint32_t g_endpoint_backbuffer_count = 0;
 bool g_allow_tearing = false;
 
 void set_note(Snapshot &s, const char *note)
@@ -389,7 +419,7 @@ bool perform_bootstrap(bool early_device_creation)
     resolve_core_exports(module, s);
     if (!s.core_exports_ready)
     {
-        set_note(s, "sl.interposer.dll loaded, but v0.4 could not resolve the manual-hooking/frame-tagging exports it needs.");
+        set_note(s, "sl.interposer.dll loaded, but v0.5 could not resolve the manual-hooking/frame-tagging exports it needs.");
         std::lock_guard lock(g_state_mutex);
         g_state = s;
         return false;
@@ -412,7 +442,7 @@ bool perform_bootstrap(bool early_device_creation)
         pref.engine = sl::EngineType::eCustom;
         pref.engineVersion = k_engine_version;
 
-        // Critical v0.4 change: D3D11 games feed a PRIVATE SAME-ADAPTER D3D12 endpoint. The game's
+        // Critical v0.5 change: D3D11 games feed a PRIVATE SAME-ADAPTER D3D12 endpoint. The game's
         // D3D11 device remains native and is never handed to DLSS-G.
         pref.renderAPI = sl::RenderAPI::eD3D12;
         pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
@@ -435,11 +465,11 @@ bool perform_bootstrap(bool early_device_creation)
         }
 
         query_requirements(s);
-        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.4 can create the same-adapter D3D12 endpoint.");
+        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.5 can create the same-adapter D3D12 endpoint.");
     }
     else if (!early_device_creation)
     {
-        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.4 never calls slInit a second time late.");
+        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.5 never calls slInit a second time late.");
     }
 
     std::lock_guard lock(g_state_mutex);
@@ -540,17 +570,17 @@ bool align_endpoint_window(bool show)
     return true;
 }
 
-bool wait_for_fence_value(uint64_t value)
+bool wait_for_release_value(uint64_t value)
 {
-    if (value == 0 || !g_shared_fence12)
+    if (value == 0 || !g_release_fence12)
         return true;
-    if (g_shared_fence12->GetCompletedValue() >= value)
+    if (g_release_fence12->GetCompletedValue() >= value)
         return true;
-    if (g_fence_event == nullptr)
+    if (g_release_fence_event == nullptr)
         return false;
-    if (FAILED(g_shared_fence12->SetEventOnCompletion(value, g_fence_event)))
+    if (FAILED(g_release_fence12->SetEventOnCompletion(value, g_release_fence_event)))
         return false;
-    return WaitForSingleObject(g_fence_event, 2000) == WAIT_OBJECT_0;
+    return WaitForSingleObject(g_release_fence_event, 2000) == WAIT_OBJECT_0;
 }
 
 void destroy_swapchain()
@@ -561,15 +591,21 @@ void destroy_swapchain()
     g_proxy_swapchain.Reset();
     g_endpoint_width = g_endpoint_height = 0;
     g_endpoint_format = DXGI_FORMAT_UNKNOWN;
+    g_endpoint_backbuffer_count = 0;
 }
 
 void destroy_bridge_resources()
 {
-    if (g_last_endpoint_done)
-        wait_for_fence_value(g_last_endpoint_done);
-    g_shared_color.reset();
-    g_shared_mv.reset();
-    g_shared_depth.reset();
+    // Resource destruction is rare (resize/shutdown), so it is fine to drain here. Normal frame
+    // reuse is handled by a three-deep ring and never waits on the immediately previous frame.
+    for (auto &slot : g_bridge_slots)
+    {
+        if (slot.release_value != 0)
+            wait_for_release_value(slot.release_value);
+        slot.reset();
+    }
+    for (auto &slot : g_command_slots)
+        slot.completed_value = 0;
     g_first_endpoint_frame = true;
 }
 
@@ -671,9 +707,9 @@ bool create_shared_texture(const D3D11_TEXTURE2D_DESC &src, SharedTexture &out, 
     return true;
 }
 
-bool create_shared_fence(Snapshot &s)
+bool create_shared_fences(Snapshot &s)
 {
-    if (g_shared_fence12 && g_shared_fence11 && g_game_context11_4)
+    if (g_input_fence12 && g_input_fence11 && g_release_fence12 && g_release_fence11 && g_game_context11_4)
         return true;
     if (!g_device12 || !g_game_device11_5 || !g_game_context11_4)
     {
@@ -681,37 +717,56 @@ bool create_shared_fence(Snapshot &s)
         return false;
     }
 
-    // Retry cleanly after a partial fence setup failure.
-    g_shared_fence11.Reset();
-    g_shared_fence12.Reset();
-    HRESULT hr = g_device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_shared_fence12));
-    if (FAILED(hr))
-    {
-        set_hr(s, hr, "Failed to create the shared D3D11/D3D12 synchronization fence.");
-        return false;
-    }
+    g_input_fence11.Reset();
+    g_input_fence12.Reset();
+    g_release_fence11.Reset();
+    g_release_fence12.Reset();
+    g_input_fence_value = 0;
+    g_release_fence_value = 0;
 
-    HANDLE handle = nullptr;
-    hr = g_device12->CreateSharedHandle(g_shared_fence12.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
-    if (FAILED(hr) || handle == nullptr)
+    auto make_shared_fence = [&](ComPtr<ID3D12Fence> &fence12, ComPtr<ID3D11Fence> &fence11,
+                                 const char *create_error, const char *open_error) -> bool
     {
-        set_hr(s, hr, "Failed to export the D3D12 synchronization fence.");
-        return false;
-    }
+        HRESULT hr = g_device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(fence12.ReleaseAndGetAddressOf()));
+        if (FAILED(hr))
+        {
+            set_hr(s, hr, create_error);
+            return false;
+        }
 
-    hr = g_game_device11_5->OpenSharedFence(handle, IID_PPV_ARGS(&g_shared_fence11));
-    CloseHandle(handle);
-    if (FAILED(hr))
-    {
-        set_hr(s, hr, "D3D11 failed to open the D3D12 shared fence.");
-        return false;
-    }
+        HANDLE handle = nullptr;
+        hr = g_device12->CreateSharedHandle(fence12.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
+        if (FAILED(hr) || handle == nullptr)
+        {
+            set_hr(s, FAILED(hr) ? hr : E_FAIL, create_error);
+            return false;
+        }
 
-    if (g_fence_event == nullptr)
-        g_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (g_fence_event == nullptr)
+        hr = g_game_device11_5->OpenSharedFence(handle, IID_PPV_ARGS(fence11.ReleaseAndGetAddressOf()));
+        CloseHandle(handle);
+        if (FAILED(hr))
+        {
+            set_hr(s, hr, open_error);
+            return false;
+        }
+        return true;
+    };
+
+    if (!make_shared_fence(g_input_fence12, g_input_fence11,
+                           "Failed to create/export the D3D11->D3D12 input fence.",
+                           "D3D11 failed to open the D3D11->D3D12 input fence."))
+        return false;
+
+    if (!make_shared_fence(g_release_fence12, g_release_fence11,
+                           "Failed to create/export the D3D12->D3D11 release fence.",
+                           "D3D11 failed to open the D3D12->D3D11 release fence."))
+        return false;
+
+    if (g_release_fence_event == nullptr)
+        g_release_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_release_fence_event == nullptr)
     {
-        set_hr(s, HRESULT_FROM_WIN32(GetLastError()), "Failed to create the endpoint fence event.");
+        set_hr(s, HRESULT_FROM_WIN32(GetLastError()), "Failed to create the endpoint release-fence event.");
         return false;
     }
     return true;
@@ -861,7 +916,13 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
             set_note(s, "slUpgradeInterface failed for the private D3D12 device.");
             return false;
         }
-        g_proxy_device12 = proxy_device;
+        // slUpgradeInterface creates a proxy with its own initial COM reference in manual-hooking
+        // mode. Adopt that reference instead of assigning through ComPtr (which would AddRef again
+        // and leak the proxy). If SL ever returns the original native pointer, take our own ref.
+        if (proxy_device == g_device12.Get())
+            g_proxy_device12 = proxy_device;
+        else
+            g_proxy_device12.Attach(proxy_device);
     }
     s.proxy_device_ready = g_proxy_device12 != nullptr;
 
@@ -913,7 +974,12 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
             set_note(s, "slUpgradeInterface failed for the endpoint DXGI factory.");
             return false;
         }
-        g_proxy_factory = proxy_factory;
+        // Same ownership rule as the upgraded device above: adopt a newly-created SL proxy,
+        // but AddRef if SL returned the original native factory unchanged.
+        if (proxy_factory == g_native_factory.Get())
+            g_proxy_factory = proxy_factory;
+        else
+            g_proxy_factory.Attach(proxy_factory);
     }
     s.proxy_factory_ready = g_proxy_factory != nullptr;
 
@@ -927,7 +993,7 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
 
     // These used to be one-shot setup operations. Keep retrying until both exist so a transient
     // interop failure cannot leave the addon displaying READY while submit_real_frame can never run.
-    if (!create_command_objects(s) || !create_shared_fence(s))
+    if (!create_command_objects(s) || !create_shared_fences(s))
         return false;
 
     s.endpoint_hr = S_OK;
@@ -987,6 +1053,12 @@ bool create_proxy_swapchain(uint32_t width, uint32_t height, DXGI_FORMAT format,
     g_endpoint_width = width;
     g_endpoint_height = height;
     g_endpoint_format = format;
+    g_endpoint_backbuffer_count = desc.BufferCount;
+    DXGI_SWAP_CHAIN_DESC1 actual_desc{};
+    IDXGISwapChain1 *desc_swapchain = g_native_swapchain ? static_cast<IDXGISwapChain1 *>(g_native_swapchain.Get())
+                                                        : static_cast<IDXGISwapChain1 *>(g_proxy_swapchain.Get());
+    if (desc_swapchain != nullptr && SUCCEEDED(desc_swapchain->GetDesc1(&actual_desc)) && actual_desc.BufferCount != 0)
+        g_endpoint_backbuffer_count = actual_desc.BufferCount;
     s.endpoint_width = width;
     s.endpoint_height = height;
     s.endpoint_format = static_cast<uint32_t>(format);
@@ -1010,18 +1082,27 @@ bool ensure_frame_bridge(ID3D11Texture2D *game_color, ID3D11Texture2D *mv, ID3D1
 
     if (cdesc.SampleDesc.Count != 1 || mdesc.SampleDesc.Count != 1 || ddesc.SampleDesc.Count != 1)
     {
-        set_note(s, "v0.4 first test requires single-sample color/MV/depth textures.");
+        set_note(s, "v0.5 requires single-sample color/MV/depth textures.");
         return false;
     }
 
-    const bool rebuild = !g_shared_color.matches(cdesc) || !g_shared_mv.matches(mdesc) || !g_shared_depth.matches(ddesc);
+    bool rebuild = false;
+    for (const auto &slot : g_bridge_slots)
+        rebuild |= !slot.matches(cdesc, mdesc, ddesc);
+
     if (rebuild)
     {
         destroy_bridge_resources();
-        if (!create_shared_texture(cdesc, g_shared_color, s) ||
-            !create_shared_texture(mdesc, g_shared_mv, s) ||
-            !create_shared_texture(ddesc, g_shared_depth, s))
-            return false;
+        for (auto &slot : g_bridge_slots)
+        {
+            if (!create_shared_texture(cdesc, slot.color, s) ||
+                !create_shared_texture(mdesc, slot.mv, s) ||
+                !create_shared_texture(ddesc, slot.depth, s))
+            {
+                destroy_bridge_resources();
+                return false;
+            }
+        }
     }
 
     if (!create_proxy_swapchain(cdesc.Width, cdesc.Height, typed_share_format(cdesc.Format), s))
@@ -1031,7 +1112,7 @@ bool ensure_frame_bridge(ID3D11Texture2D *game_color, ID3D11Texture2D *mv, ID3D1
     s.feeder_bridge_ready = true;
     s.endpoint_hr = S_OK;
     if (became_ready)
-        set_note(s, "Frame bridge ready. DLSS-G can now be enabled.");
+        set_note(s, "Three-frame bridge ready. DLSS-G can now be enabled.");
     return true;
 }
 
@@ -1082,7 +1163,8 @@ bool emit_marker(sl::PCLMarker marker, const sl::FrameToken &token, Snapshot &s)
 bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
 {
     if (!runtime || !g_game_device11 || !g_game_context11_4 || !g_native_queue12 ||
-        !g_shared_fence12 || !g_shared_fence11 || !g_proxy_swapchain || !g_command_list)
+        !g_input_fence12 || !g_input_fence11 || !g_release_fence12 || !g_release_fence11 ||
+        !g_proxy_swapchain || !g_command_list)
         return false;
 
     guides::NativeTextures guide{};
@@ -1109,47 +1191,49 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
     guide.motion_vectors->GetDesc(&mdesc);
     guide.depth->GetDesc(&ddesc);
 
-    // Reuse shared textures only after DLSS-G and our presenting queue are done consuming the
-    // previous frame. This is a GPU-side wait, not a software frame pacer.
-    if (g_last_endpoint_done != 0)
+    const uint32_t frame_number = ++g_frame_index;
+    const uint32_t slot_index = (frame_number - 1) % k_frame_ring_size;
+    BridgeSlot &bridge = g_bridge_slots[slot_index];
+    CommandSlot &slot = g_command_slots[slot_index];
+
+    // Only wait when recycling a slot from three real frames ago. This wait is inserted on the
+    // D3D11 GPU queue, so the CPU is free to continue unless the D3D12 allocator itself is still
+    // outstanding. v0.4 instead waited on the immediately previous frame and serialized both GPUs.
+    if (bridge.release_value != 0)
     {
-        const HRESULT whr = g_game_context11_4->Wait(g_shared_fence11.Get(), g_last_endpoint_done);
+        const HRESULT whr = g_game_context11_4->Wait(g_release_fence11.Get(), bridge.release_value);
         if (FAILED(whr))
         {
-            set_hr(s, whr, "D3D11 failed to wait for the previous endpoint frame.");
+            set_hr(s, whr, "D3D11 failed to wait for a recyclable frame-bridge slot.");
             return false;
         }
     }
 
-    g_game_context11->CopyResource(g_shared_color.d11.Get(), game_color);
-    g_game_context11->CopyResource(g_shared_mv.d11.Get(), guide.motion_vectors);
-    g_game_context11->CopyResource(g_shared_depth.d11.Get(), guide.depth);
+    g_game_context11->CopyResource(bridge.color.d11.Get(), game_color);
+    g_game_context11->CopyResource(bridge.mv.d11.Get(), guide.motion_vectors);
+    g_game_context11->CopyResource(bridge.depth.d11.Get(), guide.depth);
 
-    const uint64_t input_ready = ++g_fence_value;
-    HRESULT hr = g_game_context11_4->Signal(g_shared_fence11.Get(), input_ready);
+    const uint64_t input_ready = ++g_input_fence_value;
+    HRESULT hr = g_game_context11_4->Signal(g_input_fence11.Get(), input_ready);
     if (FAILED(hr))
     {
         set_hr(s, hr, "D3D11 failed to signal the Feeder input fence.");
         return false;
     }
     g_game_context11->Flush();
-    hr = g_native_queue12->Wait(g_shared_fence12.Get(), input_ready);
+    hr = g_native_queue12->Wait(g_input_fence12.Get(), input_ready);
     if (FAILED(hr))
     {
         set_hr(s, hr, "D3D12 endpoint queue failed to wait for D3D11 Feeder inputs.");
         return false;
     }
 
-    // Establish the Streamline frame identity and latency cadence before submitting the endpoint
-    // render/copy work. These markers now bracket our real D3D12 submission rather than being
-    // emitted as a cosmetic burst immediately before Present.
     sl::FrameToken *token = nullptr;
-    const uint32_t frame_number = ++g_frame_index;
     s.last_get_frame_token = (*g_get_new_frame_token)(token, &frame_number);
     s.frame_token_ready = s.last_get_frame_token == sl::Result::eOk && token != nullptr;
     if (!s.frame_token_ready)
     {
-        set_note(s, "slGetNewFrameToken failed on the real endpoint frame.");
+        set_note(s, "slGetNewFrameToken failed on the endpoint frame.");
         return false;
     }
 
@@ -1160,20 +1244,21 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
         s.last_reflex_options = (*g_reflex_set_options)(reflex);
         s.reflex_enabled = s.last_reflex_options == sl::Result::eOk;
     }
-    if (g_reflex_sleep)
-    {
-        s.last_reflex_sleep = (*g_reflex_sleep)(*token);
-        s.reflex_sleep_called = s.last_reflex_sleep == sl::Result::eOk;
-    }
+
+    // Do not call slReflexSleep here. ReShade gives us the frame at presentation time, while
+    // NVIDIA's reference integration calls Sleep at simulation start. Sleeping at the end of the
+    // frame in v0.4 turned Reflex pacing into an extra presentation stall. We keep Reflex enabled
+    // and publish the PCL cadence, but leave pacing to the game's own loop.
+    s.reflex_sleep_called = false;
 
     bool markers_ok = true;
     markers_ok &= emit_marker(sl::PCLMarker::eSimulationStart, *token, s);
     markers_ok &= emit_marker(sl::PCLMarker::eSimulationEnd, *token, s);
     markers_ok &= emit_marker(sl::PCLMarker::eRenderSubmitStart, *token, s);
 
-    const uint32_t slot_index = g_frame_index % static_cast<uint32_t>(g_command_slots.size());
-    CommandSlot &slot = g_command_slots[slot_index];
-    if (slot.completed_value && !wait_for_fence_value(slot.completed_value))
+    // D3D12 command allocator lifetime is a CPU rule, so wait only if the three-frame ring has
+    // actually wrapped before the endpoint completed that old submission.
+    if (slot.completed_value && !wait_for_release_value(slot.completed_value))
     {
         set_hr(s, DXGI_ERROR_DEVICE_HUNG, "Timed out waiting to recycle a D3D12 endpoint command allocator.");
         return false;
@@ -1188,7 +1273,7 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
         return false;
     }
 
-    // Calling GetCurrentBackBufferIndex on the PROXY every frame is part of the DLSS-G contract.
+    // These three swapchain APIs are Streamline hooks and therefore intentionally use the proxy.
     const UINT back_index = g_proxy_swapchain->GetCurrentBackBufferIndex();
     ComPtr<ID3D12Resource> endpoint_backbuffer;
     hr = g_proxy_swapchain->GetBuffer(back_index, IID_PPV_ARGS(&endpoint_backbuffer));
@@ -1200,7 +1285,7 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
 
     D3D12_RESOURCE_BARRIER barriers[2]{};
     barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barriers[0].Transition.pResource = g_shared_color.d12.Get();
+    barriers[0].Transition.pResource = bridge.color.d12.Get();
     barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
     barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -1210,7 +1295,7 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
     barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     g_command_list->ResourceBarrier(2, barriers);
-    g_command_list->CopyResource(endpoint_backbuffer.Get(), g_shared_color.d12.Get());
+    g_command_list->CopyResource(endpoint_backbuffer.Get(), bridge.color.d12.Get());
     std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
     std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
     g_command_list->ResourceBarrier(2, barriers);
@@ -1225,24 +1310,19 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
     g_native_queue12->ExecuteCommandLists(1, lists);
     markers_ok &= emit_marker(sl::PCLMarker::eRenderSubmitEnd, *token, s);
 
-    sl::Resource mv_res(sl::ResourceType::eTex2d, g_shared_mv.d12.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
-    mv_res.width = mdesc.Width; mv_res.height = mdesc.Height; mv_res.nativeFormat = static_cast<uint32_t>(mdesc.Format);
-    sl::Resource depth_res(sl::ResourceType::eTex2d, g_shared_depth.d12.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
-    depth_res.width = ddesc.Width; depth_res.height = ddesc.Height; depth_res.nativeFormat = static_cast<uint32_t>(ddesc.Format);
-    sl::Resource color_res(sl::ResourceType::eTex2d, g_shared_color.d12.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
-    color_res.width = cdesc.Width; color_res.height = cdesc.Height; color_res.nativeFormat = static_cast<uint32_t>(cdesc.Format);
+    sl::Resource mv_res(sl::ResourceType::eTex2d, bridge.mv.d12.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
+    mv_res.width = mdesc.Width; mv_res.height = mdesc.Height; mv_res.nativeFormat = static_cast<uint32_t>(bridge.mv.format);
+    sl::Resource depth_res(sl::ResourceType::eTex2d, bridge.depth.d12.Get(), static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON));
+    depth_res.width = ddesc.Width; depth_res.height = ddesc.Height; depth_res.nativeFormat = static_cast<uint32_t>(bridge.depth.format);
 
     const sl::Extent mv_extent{0, 0, mdesc.Width, mdesc.Height};
     const sl::Extent depth_extent{0, 0, ddesc.Width, ddesc.Height};
-    const sl::Extent color_extent{0, 0, cdesc.Width, cdesc.Height};
     const sl::ResourceTag tags[] = {
         sl::ResourceTag(&depth_res, sl::kBufferTypeDepth, sl::eValidUntilPresent, &depth_extent),
         sl::ResourceTag(&mv_res, sl::kBufferTypeMotionVectors, sl::eValidUntilPresent, &mv_extent),
-        // For the first real test this is final color (HUD included). It is deliberately tagged as
-        // HUD-less so FG can run; UI recomposition becomes a quality upgrade after function is proven.
-        sl::ResourceTag(&color_res, sl::kBufferTypeHUDLessColor, sl::eValidUntilPresent, &color_extent),
     };
-    s.last_set_tags = (*g_set_tag_for_frame)(*token, k_viewport, tags, static_cast<uint32_t>(sizeof(tags) / sizeof(tags[0])), nullptr);
+    s.last_set_tags = (*g_set_tag_for_frame)(*token, k_viewport, tags,
+                                              static_cast<uint32_t>(sizeof(tags) / sizeof(tags[0])), nullptr);
     s.tags_submitted = s.last_set_tags == sl::Result::eOk;
 
     const sl::Constants constants = make_test_constants(mdesc.Width, mdesc.Height, cdesc.Width, cdesc.Height);
@@ -1252,21 +1332,25 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
     sl::DLSSGOptions options{};
     options.mode = sl::DLSSGMode::eOn;
     options.numFramesToGenerate = static_cast<uint32_t>(std::max(1, std::clamp(g_requested_multiplier.load(std::memory_order_relaxed), 2, 6) - 1));
-    options.numBackBuffers = 3;
+    options.numBackBuffers = g_endpoint_backbuffer_count != 0 ? g_endpoint_backbuffer_count : 3;
     options.mvecDepthWidth = mdesc.Width;
     options.mvecDepthHeight = mdesc.Height;
     options.colorWidth = cdesc.Width;
     options.colorHeight = cdesc.Height;
-    options.colorBufferFormat = static_cast<uint32_t>(cdesc.Format);
-    options.mvecBufferFormat = static_cast<uint32_t>(mdesc.Format);
-    options.depthBufferFormat = static_cast<uint32_t>(ddesc.Format);
-    options.hudLessBufferFormat = static_cast<uint32_t>(cdesc.Format);
+    options.colorBufferFormat = static_cast<uint32_t>(g_endpoint_format);
+    options.mvecBufferFormat = static_cast<uint32_t>(bridge.mv.format);
+    options.depthBufferFormat = static_cast<uint32_t>(bridge.depth.format);
     options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
     options.enableUserInterfaceRecomposition = sl::Boolean::eFalse;
 
     if (s.max_generated_frames > 0)
         options.numFramesToGenerate = std::min(options.numFramesToGenerate, s.max_generated_frames);
     s.last_set_options = (*g_set_options)(k_viewport, options);
+    if (s.last_set_options != sl::Result::eOk)
+    {
+        set_note(s, "slDLSSGSetOptions rejected the endpoint frame.");
+        return false;
+    }
 
     markers_ok &= emit_marker(sl::PCLMarker::ePresentStart, *token, s);
     s.pcl_markers_submitted = markers_ok;
@@ -1279,22 +1363,56 @@ bool submit_real_frame(reshade::api::effect_runtime *runtime, Snapshot &s)
 
     markers_ok &= emit_marker(sl::PCLMarker::ePresentEnd, *token, s);
     s.pcl_markers_submitted = markers_ok;
-    g_dlssg_was_enabled = s.last_set_options == sl::Result::eOk;
+    g_dlssg_was_enabled = true;
 
-    const uint64_t done = ++g_fence_value;
-    hr = g_native_queue12->Signal(g_shared_fence12.Get(), done);
-    if (FAILED(hr))
+    if (!s.endpoint_present_succeeded)
     {
-        set_hr(s, hr, "Failed to signal completion of the DLSS-G endpoint frame.");
+        set_hr(s, s.last_present_hr, "Streamline proxy Present failed.");
         return false;
     }
-    g_last_endpoint_done = done;
-    slot.completed_value = done;
+
+    // Critical lifetime fix: these inputs are modified by the D3D11 game queue, which is NOT the
+    // endpoint presenting queue. NVIDIA explicitly exposes a completion fence/value for this case.
+    // Chain that internal fence onto our D3D12 queue, then signal the shared release fence that the
+    // D3D11 side uses before recycling this ring slot.
+    sl::DLSSGState present_state{};
+    s.last_get_state = (*g_get_state)(k_viewport, present_state, nullptr);
+    s.state_queried = true;
+    if (s.last_get_state == sl::Result::eOk)
+    {
+        s.status = present_state.status;
+        s.max_generated_frames = present_state.numFramesToGenerateMax;
+        s.dynamic_mfg_supported = present_state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
+        s.frames_presented_last_poll = present_state.numFramesActuallyPresented;
+        g_dlssg_presents_since_poll += present_state.numFramesActuallyPresented;
+
+        if (present_state.inputsProcessingCompletionFence != nullptr &&
+            present_state.lastPresentInputsProcessingCompletionFenceValue != 0)
+        {
+            auto *sl_completion_fence = static_cast<ID3D12Fence *>(present_state.inputsProcessingCompletionFence);
+            hr = g_native_queue12->Wait(sl_completion_fence,
+                                        present_state.lastPresentInputsProcessingCompletionFenceValue);
+            if (FAILED(hr))
+            {
+                set_hr(s, hr, "Endpoint queue failed to wait for DLSS-G input-consumption completion.");
+                return false;
+            }
+        }
+    }
+
+    const uint64_t release_value = ++g_release_fence_value;
+    hr = g_native_queue12->Signal(g_release_fence12.Get(), release_value);
+    if (FAILED(hr))
+    {
+        set_hr(s, hr, "Failed to signal safe reuse of the frame-bridge slot.");
+        return false;
+    }
+    bridge.release_value = release_value;
+    slot.completed_value = release_value;
     g_first_endpoint_frame = false;
 
-    if (s.endpoint_present_succeeded)
-        set_note(s, "REAL TEST ACTIVE: D3D11 frame + Feeder MV/depth -> shared D3D12 -> Streamline proxy Present -> NVIDIA DLSS-G x2+.");
-    return s.endpoint_present_succeeded;
+    set_note(s, "DLSS-G ACTIVE: isolated endpoint + three-frame bridge + NVIDIA input-lifetime synchronization.");
+    return true;
 }
 
 void refresh_state(Snapshot &s)
@@ -1337,13 +1455,15 @@ void poll_state(Snapshot &s)
         s.max_generated_frames = state.numFramesToGenerateMax;
         s.frames_presented_last_poll = state.numFramesActuallyPresented;
         s.dynamic_mfg_supported = state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
+        g_dlssg_presents_since_poll += state.numFramesActuallyPresented;
         if (seconds > 0.0)
         {
-            s.output_fps = static_cast<double>(state.numFramesActuallyPresented) / seconds;
+            s.output_fps = static_cast<double>(g_dlssg_presents_since_poll) / seconds;
             s.app_present_fps = static_cast<double>(g_app_presents_since_poll) / seconds;
         }
     }
     g_app_presents_since_poll = 0;
+    g_dlssg_presents_since_poll = 0;
 }
 
 void hide_endpoint()
@@ -1463,7 +1583,7 @@ void present_tick(reshade::api::effect_runtime *runtime)
         const bool endpoint_setup_incomplete =
             !s.endpoint_device_submitted || !s.feature_loaded || !s.feature_functions_ready ||
             !s.proxy_device_ready || !s.proxy_queue_ready || !s.native_queue_resolved || !s.proxy_factory_ready ||
-            !g_command_list || !g_shared_fence12 || !g_shared_fence11 || !g_game_context11_4;
+            !g_command_list || !g_input_fence12 || !g_input_fence11 || !g_release_fence12 || !g_release_fence11 || !g_game_context11_4;
 
         if (endpoint_setup_incomplete)
         {
@@ -1499,10 +1619,14 @@ void present_tick(reshade::api::effect_runtime *runtime)
                              s.proxy_swapchain_ready && s.feeder_bridge_ready &&
                              guide_state.effect_enabled && s.feature_functions_ready &&
                              s.reflex_functions_ready && s.pcl_functions_ready &&
-                             g_command_list && g_shared_fence12 && g_shared_fence11 && g_game_context11_4;
+                             g_command_list && g_input_fence12 && g_input_fence11 && g_release_fence12 && g_release_fence11 && g_game_context11_4;
 
         if (requested_enabled() && s.controller_ready)
         {
+            // DLSS5-Feeder is allowed to remain loaded. The host consumes the guide textures from
+            // DLSS5_Feed.fx while keeping this private FG presentation runtime isolated from the
+            // normal ReShade effect stack. Do not infer a conflict merely from the Feeder module
+            // being present; its NGX/DLAA path is a separate, user-selected workload.
             submit_real_frame(runtime, s);
         }
         else

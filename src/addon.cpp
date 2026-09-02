@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cwchar>
 
 #define IMGUI_DISABLE_INCLUDE_IMCONFIG_H
 #include <imgui.h>
@@ -17,15 +18,52 @@
 #include "feeder_probe.hpp"
 #include "streamline_host.hpp"
 
-extern "C" __declspec(dllexport) const char *NAME = "ReShade FrameGen - DLSS-G Host 0.4";
+extern "C" __declspec(dllexport) const char *NAME = "ReShade FrameGen - DLSS-G Host 0.5b";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "NVIDIA DLSS-G frame-generation host for D3D11 games. Uses DLSS5_Feed motion/depth, "
-    "bridges the frame to a same-GPU D3D12 Streamline endpoint, and presents through DLSS-G.";
+    "isolates a private D3D12 Streamline endpoint from ReShade effects, and presents through DLSS-G.";
 
 namespace
 {
 std::atomic<reshade::api::effect_runtime *> g_primary_runtime{nullptr};
 std::atomic<uint64_t> g_primary_area{0};
+std::atomic<reshade::api::effect_runtime *> g_endpoint_runtime{nullptr};
+
+constexpr wchar_t k_endpoint_window_class[] = L"ReShadeFrameGenDLSSGEndpoint";
+
+bool is_endpoint_runtime(reshade::api::effect_runtime *runtime)
+{
+    if (runtime == nullptr)
+        return false;
+
+    const HWND hwnd = static_cast<HWND>(runtime->get_hwnd());
+    if (hwnd == nullptr)
+        return false;
+
+    wchar_t class_name[96]{};
+    if (GetClassNameW(hwnd, class_name, static_cast<int>(sizeof(class_name) / sizeof(class_name[0]))) == 0)
+        return false;
+
+    return std::wcscmp(class_name, k_endpoint_window_class) == 0;
+}
+
+void disable_endpoint_techniques(reshade::api::effect_runtime *runtime)
+{
+    if (!is_endpoint_runtime(runtime))
+        return;
+
+    // ReShade associates an effect runtime with almost every swapchain, including our private
+    // Streamline compositor swapchain. That runtime must stay inert: running the game preset a
+    // second time on the generated-frame endpoint caused the v0.4 60 -> 3 FPS collapse.
+    if (runtime->get_effects_state())
+        runtime->set_effects_state(false);
+
+    runtime->enumerate_techniques(nullptr, [](reshade::api::effect_runtime *rt, reshade::api::effect_technique technique)
+    {
+        if (rt->get_technique_state(technique))
+            rt->set_technique_state(technique, false);
+    });
+}
 
 uint64_t runtime_area(reshade::api::effect_runtime *runtime)
 {
@@ -166,6 +204,13 @@ void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 
 void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 {
+    if (is_endpoint_runtime(runtime))
+    {
+        g_endpoint_runtime.store(runtime, std::memory_order_release);
+        disable_endpoint_techniques(runtime);
+        return;
+    }
+
     if (!consider_primary_runtime(runtime))
         return;
 
@@ -179,6 +224,12 @@ void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 
 void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 {
+    if (runtime == g_endpoint_runtime.load(std::memory_order_acquire) || is_endpoint_runtime(runtime))
+    {
+        g_endpoint_runtime.store(nullptr, std::memory_order_release);
+        return;
+    }
+
     if (runtime != g_primary_runtime.load(std::memory_order_acquire))
         return;
 
@@ -191,12 +242,35 @@ void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 
 void on_reloaded_effects(reshade::api::effect_runtime *runtime)
 {
+    if (is_endpoint_runtime(runtime))
+    {
+        disable_endpoint_techniques(runtime);
+        return;
+    }
+
     if (runtime == g_primary_runtime.load(std::memory_order_acquire))
         fg::guides::resolve(runtime);
 }
 
+bool on_set_technique_state(reshade::api::effect_runtime *runtime, reshade::api::effect_technique, bool enabled)
+{
+    // Veto attempts to enable any shader on the private compositor runtime. This catches preset
+    // loading and other add-ons trying to mirror the game runtime onto the endpoint.
+    return enabled && is_endpoint_runtime(runtime);
+}
+
+bool on_set_effects_state(reshade::api::effect_runtime *runtime, bool enabled)
+{
+    // Keep ReShade's master effects switch off on the private compositor too.
+    return enabled && is_endpoint_runtime(runtime);
+}
+
 void on_reshade_present(reshade::api::effect_runtime *runtime)
 {
+    // Never recursively drive the host from the private D3D12 swapchain that the host itself Presents.
+    if (is_endpoint_runtime(runtime))
+        return;
+
     if (!consider_primary_runtime(runtime))
         return;
     fg::slhost::present_tick(runtime);
@@ -217,6 +291,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::init_effect_runtime>(&on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(&on_destroy_effect_runtime);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(&on_reloaded_effects);
+        reshade::register_event<reshade::addon_event::reshade_set_effects_state>(&on_set_effects_state);
+        reshade::register_event<reshade::addon_event::reshade_set_technique_state>(&on_set_technique_state);
         reshade::register_event<reshade::addon_event::reshade_present>(&on_reshade_present);
         reshade::register_overlay("DLSS-G Host", &draw_overlay);
         break;
@@ -228,6 +304,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(&on_init_effect_runtime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(&on_destroy_effect_runtime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(&on_reloaded_effects);
+        reshade::unregister_event<reshade::addon_event::reshade_set_effects_state>(&on_set_effects_state);
+        reshade::unregister_event<reshade::addon_event::reshade_set_technique_state>(&on_set_technique_state);
         reshade::unregister_event<reshade::addon_event::reshade_present>(&on_reshade_present);
         reshade::unregister_addon(hinstDLL);
         break;
