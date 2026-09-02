@@ -76,8 +76,12 @@ uint64_t g_dlssg_presents_since_poll = 0;
 uint32_t g_frame_index = 0;
 std::atomic_bool g_reset_next_capture{true};
 bool g_dlssg_was_enabled = false;
+std::atomic_bool g_dlssg_mode_active{false};
+std::atomic_bool g_endpoint_visible{false};
+int g_endpoint_screen_x = 0;
+int g_endpoint_screen_y = 0;
 
-// v0.8 never calls Streamline/DXGI Present from inside ReShade's reshade_present callback.
+// v0.9 never calls Streamline/DXGI Present from inside ReShade's reshade_present callback.
 // The game thread only copies the completed NR frame into a free bridge slot and signals an
 // input fence. A dedicated worker owns frame tokens, DLSS-G calls and the private swapchain.
 std::atomic_bool g_fg_worker_stop{false};
@@ -101,7 +105,7 @@ constexpr std::array<sl::Feature, 3> k_requested_features = {
 };
 
 constexpr const char *k_project_id = "68c3c204-a7b9-43e0-a319-37b62eef12f7";
-constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.8-SafeContract";
+constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.9-StableWindow";
 const sl::ViewportHandle k_viewport{0};
 
 // The private endpoint is deliberately created with the real system DLLs rather than the game's
@@ -115,7 +119,7 @@ D3D12CreateDeviceProc g_d3d12_create_device = nullptr;
 CreateDXGIFactory2Proc g_create_dxgi_factory2 = nullptr;
 
 // ReShade D3D/DXGI proxies expose their original COM object through this private IID.
-// v0.8 unwraps BOTH the private D3D12 device and the factory before giving them to Streamline.
+// v0.9 unwraps BOTH the private D3D12 device and the factory before giving them to Streamline.
 // RenoDX does not need a ReShade wrapper around this FG-only device: its NGX detours are process
 // wide and the v0.6 log already proved it sees feature 11. Keeping a single native identity here
 // avoids proxy-on-proxy command queues/resources while the game's Feeder/NR device remains intact.
@@ -556,7 +560,7 @@ bool perform_bootstrap(bool early_device_creation)
     resolve_core_exports(module, s);
     if (!s.core_exports_ready)
     {
-        set_note(s, "sl.interposer.dll loaded, but v0.8 could not resolve the manual-hooking/frame-tagging exports it needs.");
+        set_note(s, "sl.interposer.dll loaded, but v0.9 could not resolve the manual-hooking/frame-tagging exports it needs.");
         std::lock_guard lock(g_state_mutex);
         g_state = s;
         return false;
@@ -602,11 +606,11 @@ bool perform_bootstrap(bool early_device_creation)
         }
 
         query_requirements(s);
-        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.8 can create the same-adapter D3D12 endpoint.");
+        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.9 can create the same-adapter D3D12 endpoint.");
     }
     else if (!early_device_creation)
     {
-        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.8 never calls slInit a second time late.");
+        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.9 never calls slInit a second time late.");
     }
 
     std::lock_guard lock(g_state_mutex);
@@ -625,7 +629,24 @@ LRESULT CALLBACK endpoint_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
     }
 }
 
-bool ensure_endpoint_window(Snapshot &s)
+bool get_game_client_rect_on_screen(RECT &out)
+{
+    if (g_game_hwnd == nullptr || !IsWindow(g_game_hwnd))
+        return false;
+
+    RECT client{};
+    POINT origin{0, 0};
+    if (!GetClientRect(g_game_hwnd, &client) || !ClientToScreen(g_game_hwnd, &origin))
+        return false;
+
+    out.left = origin.x;
+    out.top = origin.y;
+    out.right = origin.x + std::max<LONG>(1, client.right - client.left);
+    out.bottom = origin.y + std::max<LONG>(1, client.bottom - client.top);
+    return true;
+}
+
+bool ensure_endpoint_window(uint32_t width, uint32_t height, Snapshot &s)
 {
     if (g_endpoint_hwnd != nullptr && IsWindow(g_endpoint_hwnd))
     {
@@ -650,11 +671,22 @@ bool ensure_endpoint_window(Snapshot &s)
         }
     }
 
+    RECT game_rect{};
+    int x = 0, y = 0;
+    if (get_game_client_rect_on_screen(game_rect))
+    {
+        x = game_rect.left;
+        y = game_rect.top;
+    }
+
+    // NVIDIA explicitly requires DLSS-G to be OFF during window manipulation. Create the popup
+    // at its final presentation size while FG is still off. It remains hidden until the user
+    // enables FG; request_enabled(true) positions/shows it once BEFORE SetOptions(eOn).
     g_endpoint_hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
         L"ReShadeFrameGenDLSSGEndpoint", L"ReShadeFrameGen DLSS-G Endpoint",
         WS_POPUP,
-        0, 0, 16, 16,
+        x, y, static_cast<int>(std::max<uint32_t>(1, width)), static_cast<int>(std::max<uint32_t>(1, height)),
         nullptr, nullptr, instance, nullptr);
     if (g_endpoint_hwnd == nullptr)
     {
@@ -662,6 +694,9 @@ bool ensure_endpoint_window(Snapshot &s)
         return false;
     }
 
+    g_endpoint_screen_x = x;
+    g_endpoint_screen_y = y;
+    g_endpoint_visible.store(false, std::memory_order_release);
     ShowWindow(g_endpoint_hwnd, SW_HIDE);
     s.endpoint_window_ready = true;
     return true;
@@ -677,34 +712,61 @@ void pump_endpoint_messages()
     }
 }
 
-bool align_endpoint_window(bool show)
+bool prepare_endpoint_window_for_enable(Snapshot &s)
 {
-    if (g_endpoint_hwnd == nullptr || g_game_hwnd == nullptr || !IsWindow(g_game_hwnd))
-        return false;
-
-    if (!show || IsIconic(g_game_hwnd))
+    if (g_endpoint_hwnd == nullptr || !IsWindow(g_endpoint_hwnd) ||
+        g_endpoint_width == 0 || g_endpoint_height == 0)
     {
-        ShowWindow(g_endpoint_hwnd, SW_HIDE);
+        set_note(s, "FG endpoint window is not ready yet.");
         return false;
     }
 
-    // Avoid leaving a top-most FG surface over other applications when the game loses focus.
-    const HWND foreground = GetForegroundWindow();
-    if (foreground != g_game_hwnd && foreground != g_endpoint_hwnd)
+    // Never touch the HWND while DLSS-G may be presenting to it.
+    if (g_dlssg_mode_active.load(std::memory_order_acquire))
     {
-        ShowWindow(g_endpoint_hwnd, SW_HIDE);
+        set_note(s, "Refusing to manipulate the FG window while DLSS-G is active.");
         return false;
     }
 
-    RECT rc{};
-    POINT origin{0, 0};
-    if (!GetClientRect(g_game_hwnd, &rc) || !ClientToScreen(g_game_hwnd, &origin))
+    RECT game_rect{};
+    if (!get_game_client_rect_on_screen(game_rect))
+    {
+        set_note(s, "Could not resolve the game client rect before enabling Frame Generation.");
         return false;
-    const int width = std::max<LONG>(1, rc.right - rc.left);
-    const int height = std::max<LONG>(1, rc.bottom - rc.top);
-    SetWindowPos(g_endpoint_hwnd, HWND_TOPMOST, origin.x, origin.y, width, height,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSENDCHANGING);
+    }
+
+    const int width = static_cast<int>(g_endpoint_width);
+    const int height = static_cast<int>(g_endpoint_height);
+    if (!SetWindowPos(g_endpoint_hwnd, HWND_TOPMOST, game_rect.left, game_rect.top, width, height,
+                      SWP_NOACTIVATE | SWP_NOSENDCHANGING))
+    {
+        set_hr(s, HRESULT_FROM_WIN32(GetLastError()), "Could not position the FG endpoint before enabling DLSS-G.");
+        return false;
+    }
+
+    ShowWindow(g_endpoint_hwnd, SW_SHOWNOACTIVATE);
+    g_endpoint_screen_x = game_rect.left;
+    g_endpoint_screen_y = game_rect.top;
+    g_endpoint_visible.store(true, std::memory_order_release);
+    set_note(s, "FG endpoint locked to the game window while DLSS-G is OFF; no window mutation will occur during Present.");
     return true;
+}
+
+bool endpoint_window_still_matches_game()
+{
+    if (!g_endpoint_visible.load(std::memory_order_acquire) || g_endpoint_hwnd == nullptr)
+        return true;
+    if (IsIconic(g_game_hwnd))
+        return false;
+
+    RECT game_rect{};
+    if (!get_game_client_rect_on_screen(game_rect))
+        return false;
+
+    return game_rect.left == g_endpoint_screen_x &&
+           game_rect.top == g_endpoint_screen_y &&
+           static_cast<uint32_t>(std::max<LONG>(1, game_rect.right - game_rect.left)) == g_endpoint_width &&
+           static_cast<uint32_t>(std::max<LONG>(1, game_rect.bottom - game_rect.top)) == g_endpoint_height;
 }
 
 bool wait_for_release_value(uint64_t value)
@@ -722,8 +784,7 @@ bool wait_for_release_value(uint64_t value)
 
 void destroy_swapchain()
 {
-    if (g_endpoint_hwnd)
-        ShowWindow(g_endpoint_hwnd, SW_HIDE);
+    // Window visibility is managed separately and only while DLSS-G is confirmed OFF.
     g_native_swapchain.Reset();
     g_proxy_swapchain.Reset();
     g_endpoint_width = g_endpoint_height = 0;
@@ -1206,7 +1267,7 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
 
 bool create_proxy_swapchain(uint32_t width, uint32_t height, DXGI_FORMAT format, Snapshot &s)
 {
-    if (!g_proxy_factory || !g_proxy_queue12 || !ensure_endpoint_window(s))
+    if (!g_proxy_factory || !g_proxy_queue12 || !ensure_endpoint_window(width, height, s))
         return false;
 
     if (g_proxy_swapchain && g_endpoint_width == width && g_endpoint_height == height && g_endpoint_format == format)
@@ -1285,7 +1346,7 @@ bool ensure_frame_bridge(ID3D11Texture2D *game_color, ID3D11Texture2D *mv, ID3D1
 
     if (cdesc.SampleDesc.Count != 1 || mdesc.SampleDesc.Count != 1 || ddesc.SampleDesc.Count != 1)
     {
-        set_note(s, "v0.8 requires single-sample color/MV/depth textures.");
+        set_note(s, "v0.9 requires single-sample color/MV/depth textures.");
         return false;
     }
 
@@ -1298,6 +1359,17 @@ bool ensure_frame_bridge(ID3D11Texture2D *game_color, ID3D11Texture2D *mv, ID3D1
     const DXGI_FORMAT wanted_format = typed_share_format(cdesc.Format);
     const bool swapchain_rebuild = !g_proxy_swapchain || g_endpoint_width != cdesc.Width ||
                                    g_endpoint_height != cdesc.Height || g_endpoint_format != wanted_format;
+
+    if ((rebuild || swapchain_rebuild) && g_dlssg_mode_active.load(std::memory_order_acquire))
+    {
+        // A resize/reformat is window/swapchain manipulation. NVIDIA requires DLSS-G OFF first.
+        // Request shutdown and let a later game frame rebuild only after the worker confirms eOff.
+        g_requested_enabled.store(false, std::memory_order_release);
+        if (g_fg_worker_wake)
+            SetEvent(g_fg_worker_wake);
+        set_note(s, "Game/bridge size changed; DLSS-G is being turned off before rebuilding the endpoint.");
+        return false;
+    }
 
     // Resize/reformat is rare. Never destroy resources underneath the worker: simply skip FG
     // submissions until every old slot has retired, then rebuild on a later game Present.
@@ -1406,7 +1478,7 @@ bool capture_real_frame_nonblocking(reshade::api::effect_runtime *runtime, Snaps
     const int slot_index = acquire_free_bridge_slot();
     if (slot_index < 0)
     {
-        // Backpressure policy for v0.8: keep exactly one FG frame in flight until we have
+        // Backpressure policy for v0.9: keep exactly one FG frame in flight until we have
         // proven the complete resource-state/lifetime contract stable. Never stall the game/NR
         // pipeline; simply skip this FG input and try again next frame.
         g_dropped_frames.fetch_add(1, std::memory_order_relaxed);
@@ -1707,6 +1779,9 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
         set_note(s, "slDLSSGSetOptions rejected the dedicated-thread endpoint frame.");
         return false;
     }
+    // From this point until a successful SetOptions(eOff), the endpoint HWND is immutable.
+    g_dlssg_was_enabled = true;
+    g_dlssg_mode_active.store(true, std::memory_order_release);
 
     markers_ok &= emit_marker(sl::PCLMarker::ePresentStart, *token, s);
     s.pcl_markers_submitted = markers_ok;
@@ -1717,7 +1792,6 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
     s.endpoint_present_succeeded = s.last_present_hr == S_OK;
     markers_ok &= emit_marker(sl::PCLMarker::ePresentEnd, *token, s);
     s.pcl_markers_submitted = markers_ok;
-    g_dlssg_was_enabled = s.endpoint_present_succeeded;
 
     const HRESULT callback_hr = static_cast<HRESULT>(g_last_dlssg_api_error.load(std::memory_order_acquire));
     const HRESULT removed_hr = g_device12 ? g_device12->GetDeviceRemovedReason() : S_OK;
@@ -1727,7 +1801,6 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
         // work. This is an internal fail-safe, not another overlay diagnostic mode.
         retire_bridge_slot(slot_index, s);
         g_requested_enabled.store(false, std::memory_order_release);
-        g_dlssg_was_enabled = false;
         set_hr(s, FAILED(removed_hr) ? removed_hr : callback_hr,
                FAILED(removed_hr) ? "D3D12 device was removed during DLSS-G Present."
                                   : "DLSS-G reported an asynchronous DXGI Present error.");
@@ -1772,7 +1845,6 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
     if (bad_dlssg_status)
     {
         g_requested_enabled.store(false, std::memory_order_release);
-        g_dlssg_was_enabled = false;
         if (present_state.status & sl::DLSSGStatus::eFailCommonConstantsInvalid)
             set_note(s, "DLSS-G rejected the common frame constants; Frame Generation was stopped safely.");
         else if (present_state.status & sl::DLSSGStatus::eFailReflexNotDetectedAtRuntime)
@@ -1791,7 +1863,6 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
     if (!s.endpoint_present_succeeded)
     {
         g_requested_enabled.store(false, std::memory_order_release);
-        g_dlssg_was_enabled = false;
         if (FAILED(s.last_present_hr))
             set_hr(s, s.last_present_hr, "Streamline proxy Present failed on the dedicated FG thread.");
         else
@@ -1802,7 +1873,7 @@ bool process_bridge_slot_on_worker(uint32_t slot_index, Snapshot &s)
         return false;
     }
 
-    set_note(s, "DLSS-G ACTIVE: single-flight safe contract, explicit guide states, non-blocking game capture.");
+    set_note(s, "DLSS-G ACTIVE: stable HWND ownership, single-flight bridge, non-blocking game capture.");
     return true;
 }
 
@@ -1815,7 +1886,17 @@ void disable_dlssg_on_worker(Snapshot &s)
     sl::DLSSGOptions off{};
     off.mode = sl::DLSSGMode::eOff;
     s.last_set_options = (*g_set_options)(k_viewport, off);
-    g_dlssg_was_enabled = false;
+    if (s.last_set_options == sl::Result::eOk)
+    {
+        g_dlssg_was_enabled = false;
+        g_dlssg_mode_active.store(false, std::memory_order_release);
+    }
+    else
+    {
+        // Keep the mode-active latch set. The game thread must not hide/resize this HWND if SL did
+        // not confirm eOff. This is safer than assuming a failed disable took effect.
+        set_note(s, "DLSS-G did not confirm eOff; endpoint window will remain untouched for safety.");
+    }
 }
 
 DWORD WINAPI fg_worker_thread_proc(LPVOID)
@@ -1961,7 +2042,11 @@ void refresh_state(Snapshot &s)
 
 void hide_endpoint()
 {
-    if (g_endpoint_hwnd)
+    // NVIDIA requires DLSS-G OFF before any window manipulation. Never hide from the game thread
+    // until the worker has successfully acknowledged SetOptions(eOff).
+    if (g_dlssg_mode_active.load(std::memory_order_acquire))
+        return;
+    if (g_endpoint_hwnd && g_endpoint_visible.exchange(false, std::memory_order_acq_rel))
         ShowWindow(g_endpoint_hwnd, SW_HIDE);
 }
 }
@@ -2035,14 +2120,33 @@ void set_game_api(reshade::api::device_api api)
 
 void request_enabled(bool enabled)
 {
-    const bool previous = g_requested_enabled.exchange(enabled, std::memory_order_acq_rel);
-    if (enabled && !previous)
+    const bool previous = g_requested_enabled.load(std::memory_order_acquire);
+    if (enabled)
     {
+        if (previous)
+            return;
+
+        // Position and show exactly once while DLSS-G is still OFF. From the successful eOn call
+        // until the worker confirms eOff, no code path may resize/move/show/hide this window.
+        Snapshot s = snapshot();
+        if (!prepare_endpoint_window_for_enable(s))
+        {
+            std::lock_guard lock(g_state_mutex);
+            g_state = s;
+            return;
+        }
+
         g_reset_next_capture.store(true, std::memory_order_release);
         g_reset_fps_counters.store(true, std::memory_order_release);
+        g_requested_enabled.store(true, std::memory_order_release);
     }
-    if (!enabled)
-        hide_endpoint();
+    else
+    {
+        g_requested_enabled.store(false, std::memory_order_release);
+        // Do NOT hide here. The worker must first perform SetOptions(eOff). present_tick() will
+        // hide on a later frame after g_dlssg_mode_active becomes false.
+    }
+
     if (g_fg_worker_wake)
         SetEvent(g_fg_worker_wake);
 }
@@ -2129,13 +2233,21 @@ void present_tick(reshade::api::effect_runtime *runtime)
         if (requested_enabled() && s.controller_ready && g_fg_worker_handle != nullptr)
             queued_frame = capture_real_frame_nonblocking(runtime, s);
 
-        // The endpoint must already be visible before its first real Present. Previously we kept it
-        // hidden until Present "succeeded", which made the first CPU-side success an unreliable
-        // signal of an actually displayed/generated frame. Positioning remains on the game thread.
-        align_endpoint_window(requested_enabled() && s.controller_ready &&
-                              (queued_frame || s.endpoint_present_succeeded));
+        if (requested_enabled())
+        {
+            // Never chase the game window with SetWindowPos while DLSS-G is presenting. If the
+            // window moves, resizes, minimizes or loses focus, request eOff and leave the HWND
+            // untouched until the worker confirms the mode change.
+            const HWND foreground = GetForegroundWindow();
+            if (!endpoint_window_still_matches_game() ||
+                (foreground != g_game_hwnd && foreground != g_endpoint_hwnd))
+            {
+                request_enabled(false);
+                set_note(s, "Game window changed/focus was lost; DLSS-G is being turned off before any endpoint window manipulation.");
+            }
+        }
     }
-    else
+    else if (!requested_enabled())
     {
         hide_endpoint();
     }
