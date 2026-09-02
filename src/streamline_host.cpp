@@ -84,7 +84,7 @@ constexpr std::array<sl::Feature, 3> k_requested_features = {
 };
 
 constexpr const char *k_project_id = "68c3c204-a7b9-43e0-a319-37b62eef12f7";
-constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.3-D3D12Endpoint";
+constexpr const char *k_engine_version = "ReShadeFrameGen-DLSSGHost-0.4-InteropFix";
 const sl::ViewportHandle k_viewport{0};
 
 // The private endpoint is deliberately created with the real system DLLs rather than the game's
@@ -127,6 +127,39 @@ HANDLE g_fence_event = nullptr;
 uint64_t g_fence_value = 0;
 uint64_t g_last_endpoint_done = 0;
 
+std::mutex g_note_log_mutex;
+std::string g_last_logged_note;
+
+// Shared textures must use a typed member of the backbuffer's format family.
+// This mirrors the proven DLSS5-Feeder D3D11<->D3D12 transport and avoids
+// CreateSharedHandle / swapchain failures on typeless and sRGB backbuffers.
+DXGI_FORMAT typed_share_format(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default:
+        return format;
+    }
+}
+
 struct SharedTexture
 {
     ComPtr<ID3D12Resource> d12;
@@ -139,7 +172,7 @@ struct SharedTexture
 
     bool matches(const D3D11_TEXTURE2D_DESC &desc) const
     {
-        return d12 && d11 && format == desc.Format && width == desc.Width && height == desc.Height &&
+        return d12 && d11 && format == typed_share_format(desc.Format) && width == desc.Width && height == desc.Height &&
                mip_levels == desc.MipLevels && array_size == desc.ArraySize && desc.SampleDesc.Count == 1;
     }
 
@@ -167,7 +200,21 @@ bool g_allow_tearing = false;
 
 void set_note(Snapshot &s, const char *note)
 {
-    s.bootstrap_note = note != nullptr ? note : "";
+    const std::string next = note != nullptr ? note : "";
+    s.bootstrap_note = next;
+
+    // Keep the overlay functional and compact. Detailed stage changes go to ReShade.log,
+    // and are de-duplicated so a successful per-frame path does not spam the file.
+    if (!next.empty())
+    {
+        std::lock_guard log_lock(g_note_log_mutex);
+        if (next != g_last_logged_note)
+        {
+            const std::string line = "[ReShadeFrameGen] " + next;
+            reshade::log::message(reshade::log::level::info, line.c_str());
+            g_last_logged_note = next;
+        }
+    }
 }
 
 void set_hr(Snapshot &s, HRESULT hr, const char *note)
@@ -342,7 +389,7 @@ bool perform_bootstrap(bool early_device_creation)
     resolve_core_exports(module, s);
     if (!s.core_exports_ready)
     {
-        set_note(s, "sl.interposer.dll loaded, but v0.3 could not resolve the manual-hooking/frame-tagging exports it needs.");
+        set_note(s, "sl.interposer.dll loaded, but v0.4 could not resolve the manual-hooking/frame-tagging exports it needs.");
         std::lock_guard lock(g_state_mutex);
         g_state = s;
         return false;
@@ -365,7 +412,7 @@ bool perform_bootstrap(bool early_device_creation)
         pref.engine = sl::EngineType::eCustom;
         pref.engineVersion = k_engine_version;
 
-        // Critical v0.3 change: D3D11 games feed a PRIVATE SAME-ADAPTER D3D12 endpoint. The game's
+        // Critical v0.4 change: D3D11 games feed a PRIVATE SAME-ADAPTER D3D12 endpoint. The game's
         // D3D11 device remains native and is never handed to DLSS-G.
         pref.renderAPI = sl::RenderAPI::eD3D12;
         pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
@@ -388,11 +435,11 @@ bool perform_bootstrap(bool early_device_creation)
         }
 
         query_requirements(s);
-        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.3 can create the same-adapter D3D12 endpoint.");
+        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.4 can create the same-adapter D3D12 endpoint.");
     }
     else if (!early_device_creation)
     {
-        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.3 never calls slInit a second time late.");
+        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.4 never calls slInit a second time late.");
     }
 
     std::lock_guard lock(g_state_mutex);
@@ -531,6 +578,9 @@ bool create_shared_texture(const D3D11_TEXTURE2D_DESC &src, SharedTexture &out, 
     if (!g_device12 || !g_game_device11_1 || src.Width == 0 || src.Height == 0 || src.SampleDesc.Count != 1)
         return false;
 
+    const DXGI_FORMAT share_format = typed_share_format(src.Format);
+
+    // First try the natural D3D12 -> D3D11 direction. This works on many drivers.
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
@@ -545,43 +595,75 @@ bool create_shared_texture(const D3D11_TEXTURE2D_DESC &src, SharedTexture &out, 
     desc.Height = src.Height;
     desc.DepthOrArraySize = static_cast<UINT16>(std::max<UINT>(1, src.ArraySize));
     desc.MipLevels = static_cast<UINT16>(std::max<UINT>(1, src.MipLevels));
-    desc.Format = src.Format;
+    desc.Format = share_format;
     desc.SampleDesc.Count = 1;
     desc.SampleDesc.Quality = 0;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
 
     ComPtr<ID3D12Resource> d12;
-    HRESULT hr = g_device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc,
-                                                      D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                      IID_PPV_ARGS(&d12));
-    if (FAILED(hr))
-    {
-        set_hr(s, hr, "D3D12 failed to create one of the shared Feeder bridge textures.");
-        return false;
-    }
-
-    HANDLE handle = nullptr;
-    hr = g_device12->CreateSharedHandle(d12.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
-    if (FAILED(hr) || handle == nullptr)
-    {
-        set_hr(s, hr, "D3D12 failed to create a shared handle for a Feeder bridge texture.");
-        return false;
-    }
-
     ComPtr<ID3D11Texture2D> d11;
-    hr = g_game_device11_1->OpenSharedResource1(handle, IID_PPV_ARGS(&d11));
-    CloseHandle(handle);
-    if (FAILED(hr))
+    HANDLE handle = nullptr;
+
+    HRESULT first_hr = g_device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc,
+                                                            D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(&d12));
+    if (SUCCEEDED(first_hr))
+        first_hr = g_device12->CreateSharedHandle(d12.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
+    if (SUCCEEDED(first_hr) && handle != nullptr)
+        first_hr = g_game_device11_1->OpenSharedResource1(handle, IID_PPV_ARGS(&d11));
+    if (handle != nullptr)
     {
-        set_hr(s, hr, "D3D11 failed to open a D3D12 shared texture on the same adapter.");
-        return false;
+        CloseHandle(handle);
+        handle = nullptr;
+    }
+
+    if (FAILED(first_hr) || !d12 || !d11)
+    {
+        // Important: some D3D11 drivers reject resources created in the D3D12 -> D3D11
+        // direction. DLSS5-Feeder already handles this in production by reversing ownership:
+        // create the NT-handle texture on D3D11, then open that same allocation on D3D12.
+        d11.Reset();
+        d12.Reset();
+
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = src.Width;
+        td.Height = src.Height;
+        td.MipLevels = std::max<UINT>(1, src.MipLevels);
+        td.ArraySize = std::max<UINT>(1, src.ArraySize);
+        td.Format = share_format;
+        td.SampleDesc.Count = 1;
+        td.SampleDesc.Quality = 0;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = 0;
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+
+        HRESULT hr = g_game_device11_1->CreateTexture2D(&td, nullptr, &d11);
+        ComPtr<IDXGIResource1> dxgi_resource;
+        if (SUCCEEDED(hr))
+            hr = d11.As(&dxgi_resource);
+        if (SUCCEEDED(hr))
+            hr = dxgi_resource->CreateSharedHandle(nullptr,
+                                                   DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                                   nullptr, &handle);
+        if (SUCCEEDED(hr) && handle != nullptr)
+            hr = g_device12->OpenSharedHandle(handle, IID_PPV_ARGS(&d12));
+        if (handle != nullptr)
+            CloseHandle(handle);
+
+        if (FAILED(hr) || !d11 || !d12)
+        {
+            set_hr(s, FAILED(hr) ? hr : first_hr,
+                   "Both D3D12->D3D11 and D3D11->D3D12 shared-texture creation failed.");
+            return false;
+        }
     }
 
     out.reset();
     out.d12 = d12;
     out.d11 = d11;
-    out.format = src.Format;
+    out.format = share_format;
     out.width = src.Width;
     out.height = src.Height;
     out.mip_levels = static_cast<uint16_t>(std::max<UINT>(1, src.MipLevels));
@@ -599,6 +681,9 @@ bool create_shared_fence(Snapshot &s)
         return false;
     }
 
+    // Retry cleanly after a partial fence setup failure.
+    g_shared_fence11.Reset();
+    g_shared_fence12.Reset();
     HRESULT hr = g_device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_shared_fence12));
     if (FAILED(hr))
     {
@@ -663,45 +748,61 @@ bool create_command_objects(Snapshot &s)
 
 bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
 {
-    if (g_device12)
-    {
-        s.endpoint_device_created = true;
-        return true;
-    }
     if (game_device == nullptr || !s.streamline_initialized || !s.core_exports_ready)
         return false;
     if (!load_system_graphics_exports(s))
         return false;
 
+    // This function is intentionally idempotent. Earlier builds returned as soon as g_device12
+    // existed, which permanently stranded a partially-built endpoint after any one-time failure.
     g_game_device11 = game_device;
-    game_device->QueryInterface(IID_PPV_ARGS(&g_game_device11_1));
-    game_device->QueryInterface(IID_PPV_ARGS(&g_game_device11_5));
-    game_device->GetImmediateContext(&g_game_context11);
-    if (g_game_context11)
+    if (!g_game_device11_1)
+        game_device->QueryInterface(IID_PPV_ARGS(&g_game_device11_1));
+    if (!g_game_device11_5)
+        game_device->QueryInterface(IID_PPV_ARGS(&g_game_device11_5));
+    if (!g_game_context11)
+        game_device->GetImmediateContext(&g_game_context11);
+    if (g_game_context11 && !g_game_context11_4)
         g_game_context11.As(&g_game_context11_4);
 
-    ComPtr<IDXGIDevice> dxgi_device;
-    ComPtr<IDXGIAdapter> adapter;
-    HRESULT hr = game_device->QueryInterface(IID_PPV_ARGS(&dxgi_device));
-    if (SUCCEEDED(hr))
-        hr = dxgi_device->GetAdapter(&adapter);
-    if (FAILED(hr) || !adapter)
+    if (!g_game_device11_1 || !g_game_device11_5 || !g_game_context11_4)
     {
-        set_hr(s, hr, "Could not resolve the D3D11 game's DXGI adapter for the same-adapter D3D12 endpoint.");
+        set_note(s, "The D3D11 device does not expose the interop interfaces required by the D3D12 frame-generation endpoint.");
         return false;
     }
-    adapter.As(&g_game_adapter);
+    s.game_d3d11_seen = true;
 
-    hr = g_d3d12_create_device(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device12));
-    if (FAILED(hr))
+    if (!g_game_adapter)
     {
-        set_hr(s, hr, "D3D12CreateDevice failed on the D3D11 game's adapter. DLSS-G endpoint cannot start.");
-        return false;
+        ComPtr<IDXGIDevice> dxgi_device;
+        ComPtr<IDXGIAdapter> adapter;
+        HRESULT hr = game_device->QueryInterface(IID_PPV_ARGS(&dxgi_device));
+        if (SUCCEEDED(hr))
+            hr = dxgi_device->GetAdapter(&adapter);
+        if (FAILED(hr) || !adapter)
+        {
+            set_hr(s, hr, "Could not resolve the D3D11 game's DXGI adapter for the same-adapter D3D12 endpoint.");
+            return false;
+        }
+        adapter.As(&g_game_adapter);
     }
-    s.endpoint_device_created = true;
 
-    s.last_set_device = (*g_set_d3d_device)(g_device12.Get());
-    s.endpoint_device_submitted = s.last_set_device == sl::Result::eOk;
+    if (!g_device12)
+    {
+        HRESULT hr = g_d3d12_create_device(g_game_adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device12));
+        if (FAILED(hr))
+        {
+            set_hr(s, hr, "D3D12CreateDevice failed on the D3D11 game's adapter. DLSS-G endpoint cannot start.");
+            return false;
+        }
+    }
+    s.endpoint_device_created = g_device12 != nullptr;
+
+    if (!s.endpoint_device_submitted)
+    {
+        s.last_set_device = (*g_set_d3d_device)(g_device12.Get());
+        s.endpoint_device_submitted = s.last_set_device == sl::Result::eOk;
+    }
     if (!s.endpoint_device_submitted)
     {
         set_note(s, "Private D3D12 device exists, but slSetD3DDevice rejected it.");
@@ -710,7 +811,7 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
 
     query_requirements(s);
 
-    if (g_game_adapter && g_is_feature_supported)
+    if (g_game_adapter && g_is_feature_supported && !s.endpoint_feature_supported)
     {
         DXGI_ADAPTER_DESC1 ad{};
         if (SUCCEEDED(g_game_adapter->GetDesc1(&ad)))
@@ -722,9 +823,12 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
             s.endpoint_feature_supported = s.last_supported == sl::Result::eOk;
         }
     }
+    if (!s.endpoint_feature_supported)
+    {
+        set_note(s, "NVIDIA Streamline reports DLSS-G unsupported on the selected game adapter.");
+        return false;
+    }
 
-    // Requested features are normally loaded automatically after slSetD3DDevice. If this exact
-    // plugin build still reports not-loaded, explicitly ask SL to load it while no rendering is in flight.
     bool loaded = false;
     s.last_is_loaded = (*g_is_feature_loaded)(sl::kFeatureDLSS_G, loaded);
     if (s.last_is_loaded != sl::Result::eOk || !loaded)
@@ -735,63 +839,83 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
         s.last_is_loaded = (*g_is_feature_loaded)(sl::kFeatureDLSS_G, loaded);
     }
     s.feature_loaded = s.last_is_loaded == sl::Result::eOk && loaded;
-
-    resolve_feature_functions(s);
     if (!s.feature_loaded)
     {
-        set_note(s, "The D3D12 endpoint device is active, but Streamline still reports DLSS-G feature missing. See requirements/support and SL log.");
+        set_note(s, "The D3D12 endpoint device is active, but Streamline could not load DLSS-G.");
         return false;
     }
 
-    ID3D12Device *proxy_device = g_device12.Get();
-    s.last_upgrade_device = (*g_upgrade_interface)(reinterpret_cast<void **>(&proxy_device));
-    if (s.last_upgrade_device != sl::Result::eOk || proxy_device == nullptr)
+    resolve_feature_functions(s);
+    if (!s.feature_functions_ready)
     {
-        set_note(s, "slUpgradeInterface failed for the private D3D12 device.");
-        return false;
-    }
-    g_proxy_device12 = proxy_device;
-    s.proxy_device_ready = true;
-
-    D3D12_COMMAND_QUEUE_DESC qdesc{};
-    qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    qdesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-    qdesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-    qdesc.NodeMask = 0;
-    hr = g_proxy_device12->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&g_proxy_queue12));
-    if (FAILED(hr))
-    {
-        set_hr(s, hr, "Streamline proxy device failed to create the presenting command queue.");
-        return false;
-    }
-    s.proxy_queue_ready = true;
-
-    void *native_queue = nullptr;
-    s.last_get_native_queue = (*g_get_native_interface)(g_proxy_queue12.Get(), &native_queue);
-    if (s.last_get_native_queue != sl::Result::eOk || native_queue == nullptr)
-    {
-        set_note(s, "Streamline created the proxy queue, but slGetNativeInterface could not recover its native queue.");
-        return false;
-    }
-    g_native_queue12.Attach(static_cast<ID3D12CommandQueue *>(native_queue));
-    s.native_queue_resolved = true;
-
-    hr = g_create_dxgi_factory2(0, IID_PPV_ARGS(&g_native_factory));
-    if (FAILED(hr))
-    {
-        set_hr(s, hr, "Could not create the native DXGI factory for the DLSS-G endpoint.");
+        set_note(s, "DLSS-G loaded, but its SetOptions/GetState entry points are not available yet.");
         return false;
     }
 
-    IDXGIFactory4 *proxy_factory = g_native_factory.Get();
-    s.last_upgrade_factory = (*g_upgrade_interface)(reinterpret_cast<void **>(&proxy_factory));
-    if (s.last_upgrade_factory != sl::Result::eOk || proxy_factory == nullptr)
+    if (!g_proxy_device12)
     {
-        set_note(s, "slUpgradeInterface failed for the endpoint DXGI factory.");
-        return false;
+        ID3D12Device *proxy_device = g_device12.Get();
+        s.last_upgrade_device = (*g_upgrade_interface)(reinterpret_cast<void **>(&proxy_device));
+        if (s.last_upgrade_device != sl::Result::eOk || proxy_device == nullptr)
+        {
+            set_note(s, "slUpgradeInterface failed for the private D3D12 device.");
+            return false;
+        }
+        g_proxy_device12 = proxy_device;
     }
-    g_proxy_factory = proxy_factory;
-    s.proxy_factory_ready = true;
+    s.proxy_device_ready = g_proxy_device12 != nullptr;
+
+    if (!g_proxy_queue12)
+    {
+        D3D12_COMMAND_QUEUE_DESC qdesc{};
+        qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        qdesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+        qdesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+        qdesc.NodeMask = 0;
+        const HRESULT hr = g_proxy_device12->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&g_proxy_queue12));
+        if (FAILED(hr))
+        {
+            set_hr(s, hr, "Streamline proxy device failed to create the presenting command queue.");
+            return false;
+        }
+    }
+    s.proxy_queue_ready = g_proxy_queue12 != nullptr;
+
+    if (!g_native_queue12)
+    {
+        void *native_queue = nullptr;
+        s.last_get_native_queue = (*g_get_native_interface)(g_proxy_queue12.Get(), &native_queue);
+        if (s.last_get_native_queue != sl::Result::eOk || native_queue == nullptr)
+        {
+            set_note(s, "Streamline proxy queue exists, but slGetNativeInterface could not recover its native queue.");
+            return false;
+        }
+        g_native_queue12.Attach(static_cast<ID3D12CommandQueue *>(native_queue));
+    }
+    s.native_queue_resolved = g_native_queue12 != nullptr;
+
+    if (!g_native_factory)
+    {
+        const HRESULT hr = g_create_dxgi_factory2(0, IID_PPV_ARGS(&g_native_factory));
+        if (FAILED(hr))
+        {
+            set_hr(s, hr, "Could not create the native DXGI factory for the DLSS-G endpoint.");
+            return false;
+        }
+    }
+
+    if (!g_proxy_factory)
+    {
+        IDXGIFactory4 *proxy_factory = g_native_factory.Get();
+        s.last_upgrade_factory = (*g_upgrade_interface)(reinterpret_cast<void **>(&proxy_factory));
+        if (s.last_upgrade_factory != sl::Result::eOk || proxy_factory == nullptr)
+        {
+            set_note(s, "slUpgradeInterface failed for the endpoint DXGI factory.");
+            return false;
+        }
+        g_proxy_factory = proxy_factory;
+    }
+    s.proxy_factory_ready = g_proxy_factory != nullptr;
 
     ComPtr<IDXGIFactory5> f5;
     if (SUCCEEDED(g_native_factory.As(&f5)))
@@ -801,10 +925,13 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
             g_allow_tearing = allow == TRUE;
     }
 
+    // These used to be one-shot setup operations. Keep retrying until both exist so a transient
+    // interop failure cannot leave the addon displaying READY while submit_real_frame can never run.
     if (!create_command_objects(s) || !create_shared_fence(s))
         return false;
 
-    set_note(s, "Private same-adapter D3D12 device is live and DLSS-G is loaded. Waiting for Feeder guides + endpoint swapchain on the primary game surface.");
+    s.endpoint_hr = S_OK;
+    set_note(s, "DLSS-G endpoint is initialized. Building the shared frame bridge.");
     return true;
 }
 
@@ -883,7 +1010,7 @@ bool ensure_frame_bridge(ID3D11Texture2D *game_color, ID3D11Texture2D *mv, ID3D1
 
     if (cdesc.SampleDesc.Count != 1 || mdesc.SampleDesc.Count != 1 || ddesc.SampleDesc.Count != 1)
     {
-        set_note(s, "v0.3 first test requires single-sample color/MV/depth textures.");
+        set_note(s, "v0.4 first test requires single-sample color/MV/depth textures.");
         return false;
     }
 
@@ -897,10 +1024,14 @@ bool ensure_frame_bridge(ID3D11Texture2D *game_color, ID3D11Texture2D *mv, ID3D1
             return false;
     }
 
-    if (!create_proxy_swapchain(cdesc.Width, cdesc.Height, cdesc.Format, s))
+    if (!create_proxy_swapchain(cdesc.Width, cdesc.Height, typed_share_format(cdesc.Format), s))
         return false;
 
+    const bool became_ready = !s.feeder_bridge_ready;
     s.feeder_bridge_ready = true;
+    s.endpoint_hr = S_OK;
+    if (became_ready)
+        set_note(s, "Frame bridge ready. DLSS-G can now be enabled.");
     return true;
 }
 
@@ -1324,16 +1455,24 @@ void present_tick(reshade::api::effect_runtime *runtime)
         refresh_state(s);
     }
 
-    // Bind the private D3D12 endpoint only after the primary runtime is known AND the Feeder guide
-    // technique is actively updating. This avoids accidentally binding to splash/video D3D11 devices.
+    // Keep driving endpoint construction until every object needed for an actual Present exists.
+    // The old one-shot path could get stuck forever after a single interop failure.
     if (runtime && runtime->get_device() && runtime->get_device()->get_api() == reshade::api::device_api::d3d11 &&
-        s.streamline_initialized && !s.endpoint_device_created)
+        s.streamline_initialized)
     {
-        const guides::Snapshot guide_state = guides::snapshot();
-        if (guide_state.effect_enabled)
+        const bool endpoint_setup_incomplete =
+            !s.endpoint_device_submitted || !s.feature_loaded || !s.feature_functions_ready ||
+            !s.proxy_device_ready || !s.proxy_queue_ready || !s.native_queue_resolved || !s.proxy_factory_ready ||
+            !g_command_list || !g_shared_fence12 || !g_shared_fence11 || !g_game_context11_4;
+
+        if (endpoint_setup_incomplete)
         {
-            ID3D11Device *native = reinterpret_cast<ID3D11Device *>(static_cast<uintptr_t>(runtime->get_device()->get_native()));
-            create_private_d3d12_endpoint(native, s);
+            const guides::Snapshot guide_state = guides::snapshot();
+            if (guide_state.effect_enabled)
+            {
+                ID3D11Device *native = reinterpret_cast<ID3D11Device *>(static_cast<uintptr_t>(runtime->get_device()->get_native()));
+                create_private_d3d12_endpoint(native, s);
+            }
         }
     }
 
@@ -1357,9 +1496,10 @@ void present_tick(reshade::api::effect_runtime *runtime)
 
         s.controller_ready = s.streamline_initialized && s.endpoint_device_submitted && s.endpoint_feature_supported &&
                              s.feature_loaded && s.proxy_device_ready && s.proxy_queue_ready && s.native_queue_resolved && s.proxy_factory_ready &&
-                             s.proxy_swapchain_ready && s.native_swapchain_resolved && s.feeder_bridge_ready &&
+                             s.proxy_swapchain_ready && s.feeder_bridge_ready &&
                              guide_state.effect_enabled && s.feature_functions_ready &&
-                             s.reflex_functions_ready && s.pcl_functions_ready;
+                             s.reflex_functions_ready && s.pcl_functions_ready &&
+                             g_command_list && g_shared_fence12 && g_shared_fence11 && g_game_context11_4;
 
         if (requested_enabled() && s.controller_ready)
         {
