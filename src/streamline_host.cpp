@@ -98,6 +98,13 @@ using CreateDXGIFactory2Proc = HRESULT (WINAPI *)(UINT, REFIID, void **);
 D3D12CreateDeviceProc g_d3d12_create_device = nullptr;
 CreateDXGIFactory2Proc g_create_dxgi_factory2 = nullptr;
 
+// ReShade DXGI proxies expose their original COM object through this private IID.
+// Keeping the D3D12 DEVICE ReShade-visible is intentional (RenoDX/Feeder need to see NGX),
+// but the DLSS-G PRESENTATION SWAPCHAIN must be created on the unwrapped factory so ReShade
+// does not create a second effect_runtime and make DLSS5-Feeder switch away from the game.
+constexpr GUID k_reshade_unwrapped_object =
+    { 0x7f2c9a11, 0x3b4e, 0x4d6a, { 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
+
 ComPtr<ID3D11Device> g_game_device11;
 ComPtr<ID3D11Device1> g_game_device11_1;
 ComPtr<ID3D11Device5> g_game_device11_5;
@@ -465,11 +472,11 @@ bool perform_bootstrap(bool early_device_creation)
         }
 
         query_requirements(s);
-        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.5 can create the same-adapter D3D12 endpoint.");
+        set_note(s, "Streamline initialized as D3D12. Waiting for the D3D11 game device so v0.6 can create the same-adapter D3D12 endpoint.");
     }
     else if (!early_device_creation)
     {
-        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.5 never calls slInit a second time late.");
+        set_note(s, "DLL state refreshed. A cold restart is required to retry slInit; v0.6 never calls slInit a second time late.");
     }
 
     std::lock_guard lock(g_state_mutex);
@@ -957,11 +964,38 @@ bool create_private_d3d12_endpoint(ID3D11Device *game_device, Snapshot &s)
 
     if (!g_native_factory)
     {
-        const HRESULT hr = g_create_dxgi_factory2(0, IID_PPV_ARGS(&g_native_factory));
-        if (FAILED(hr))
+        // CreateDXGIFactory2 is normally intercepted by ReShade, so the first object returned here
+        // is a ReShade DXGI proxy. Creating our swapchain through that proxy makes ReShade create
+        // another effect_runtime. DLSS5-Feeder stores only one runtime globally, so that second
+        // runtime steals Feeder away from the game's D3D11 runtime and RenoDX never sees its DLSS
+        // create/evaluate calls. Unwrap ONLY the factory; keep the private D3D12 device/queue
+        // ReShade-visible so RenoDX can continue observing the NGX work Feeder performs.
+        ComPtr<IDXGIFactory4> created_factory;
+        HRESULT hr = g_create_dxgi_factory2(0, IID_PPV_ARGS(&created_factory));
+        if (FAILED(hr) || !created_factory)
         {
-            set_hr(s, hr, "Could not create the native DXGI factory for the DLSS-G endpoint.");
+            set_hr(s, hr, "Could not create the DXGI factory for the DLSS-G endpoint.");
             return false;
+        }
+
+        IUnknown *unwrapped = nullptr;
+        const HRESULT unwrap_hr = created_factory->QueryInterface(k_reshade_unwrapped_object,
+                                                                   reinterpret_cast<void **>(&unwrapped));
+        if (SUCCEEDED(unwrap_hr) && unwrapped != nullptr)
+        {
+            hr = unwrapped->QueryInterface(IID_PPV_ARGS(&g_native_factory));
+            unwrapped->Release();
+            if (FAILED(hr) || !g_native_factory)
+            {
+                set_hr(s, hr, "ReShade exposed its unwrapped DXGI factory, but IDXGIFactory4 recovery failed.");
+                return false;
+            }
+            set_note(s, "Native DXGI factory recovered behind ReShade; the FG swapchain will not create a second ReShade runtime.");
+        }
+        else
+        {
+            // If this call already bypassed ReShade there is nothing to unwrap. Use it directly.
+            g_native_factory = created_factory;
         }
     }
 
@@ -1082,7 +1116,7 @@ bool ensure_frame_bridge(ID3D11Texture2D *game_color, ID3D11Texture2D *mv, ID3D1
 
     if (cdesc.SampleDesc.Count != 1 || mdesc.SampleDesc.Count != 1 || ddesc.SampleDesc.Count != 1)
     {
-        set_note(s, "v0.5 requires single-sample color/MV/depth textures.");
+        set_note(s, "v0.6 requires single-sample color/MV/depth textures.");
         return false;
     }
 
