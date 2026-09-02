@@ -21,7 +21,6 @@ struct Snapshot
     DllState sl_common;
     DllState ngx_dlssg;
 
-    bool renodx_dlss_loaded = false;
     bool renodx_dlss5_loaded = false;
     bool feeder_loaded = false;
 };

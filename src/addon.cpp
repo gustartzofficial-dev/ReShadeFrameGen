@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 #define IMGUI_DISABLE_INCLUDE_IMCONFIG_H
@@ -19,10 +20,9 @@
 #include "feeder_probe.hpp"
 #include "streamline_host.hpp"
 
-extern "C" __declspec(dllexport) const char *NAME = "ReShade FrameGen - DLSS-G Host 0.2.1 Bootstrap";
+extern "C" __declspec(dllexport) const char *NAME = "ReShade FrameGen - DLSS-G Host 0.3 D3D12 Endpoint";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Clean-slate DLSS-G bootstrap/controller (0.2.1 build fix). Finds and loads the real Streamline DLLs, requests DLSS-G/Reflex/PCL early, "
-    "submits the real D3D11/D3D12 game device, and only arms NVIDIA Frame Generation when Streamline presentation is actually attached.";
+    "Experimental real NVIDIA DLSS-G path for D3D11 games. Reuses DLSS5_Feed motion/depth, bridges the final D3D11 frame to a same-adapter D3D12 endpoint, and presents through a Streamline proxy swapchain.";
 
 namespace
 {
@@ -57,6 +57,7 @@ bool consider_primary_runtime(reshade::api::effect_runtime *runtime)
         g_primary_runtime.store(runtime, std::memory_order_release);
         g_primary_area.store(area, std::memory_order_relaxed);
         current = runtime;
+        fg::slhost::on_primary_runtime(runtime);
     }
     return current == runtime;
 }
@@ -96,7 +97,7 @@ void draw_dll(const char *name, const fg::deps::DllState &dll)
     if (dll.loaded)
         ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "LOADED");
     else
-        ImGui::TextDisabled("not loaded yet");
+        ImGui::TextDisabled("not mapped yet");
     if (dll.found && !dll.path.empty())
     {
         const std::string path = fg::deps::narrow(dll.path);
@@ -129,10 +130,15 @@ void draw_dlssg_failures(const fg::slhost::Snapshot &s)
 
     ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "DLSS-G runtime status: 0x%08X", static_cast<uint32_t>(s.status));
     if (has_status(s.status, sl::DLSSGStatus::eFailResolutionTooLow)) ImGui::BulletText("Output resolution too low.");
-    if (has_status(s.status, sl::DLSSGStatus::eFailReflexNotDetectedAtRuntime)) ImGui::BulletText("Reflex cadence is missing/not detected.");
-    if (has_status(s.status, sl::DLSSGStatus::eFailHDRFormatNotSupported)) ImGui::BulletText("Backbuffer/HDR format unsupported.");
-    if (has_status(s.status, sl::DLSSGStatus::eFailCommonConstantsInvalid)) ImGui::BulletText("Common camera/frame constants are missing or invalid.");
-    if (has_status(s.status, sl::DLSSGStatus::eFailGetCurrentBackBufferIndexNotCalled)) ImGui::BulletText("Streamline swapchain/backbuffer-index contract is incomplete.");
+    if (has_status(s.status, sl::DLSSGStatus::eFailReflexNotDetectedAtRuntime)) ImGui::BulletText("Reflex/PCL cadence is missing or out of sync.");
+    if (has_status(s.status, sl::DLSSGStatus::eFailHDRFormatNotSupported)) ImGui::BulletText("Backbuffer/HDR format is unsupported by this first endpoint.");
+    if (has_status(s.status, sl::DLSSGStatus::eFailCommonConstantsInvalid)) ImGui::BulletText("The generic first-test camera constants are not sufficient for this game.");
+    if (has_status(s.status, sl::DLSSGStatus::eFailGetCurrentBackBufferIndexNotCalled)) ImGui::BulletText("The Streamline proxy swapchain/backbuffer-index contract is incomplete.");
+}
+
+void draw_result(const char *label, sl::Result result)
+{
+    ImGui::Text("%s: %s", label, fg::slhost::result_name(result));
 }
 
 void draw_overlay(reshade::api::effect_runtime *)
@@ -141,89 +147,149 @@ void draw_overlay(reshade::api::effect_runtime *)
     const fg::guides::Snapshot guides = fg::guides::snapshot();
     const fg::slhost::Snapshot s = fg::slhost::snapshot();
 
-    ImGui::TextUnformatted("DLSS-G Host 0.2.1 - bootstrap test");
-    ImGui::TextDisabled("No legacy interpolation. No fake extra Present. Uses the real NVIDIA Streamline/DLSS-G DLLs.");
+    ImGui::TextUnformatted("DLSS-G Host 0.3 - D3D11 -> D3D12 endpoint");
+    ImGui::TextDisabled("First build that actually consumes DLSS5_Feed MV/depth and attempts a real NVIDIA DLSS-G proxy Present.");
     ImGui::Separator();
 
     ImGui::Text("Game API: %s", api_name(g_api));
     ImGui::Text("Primary ReShade surface: %s", g_primary_runtime.load(std::memory_order_acquire) ? "selected" : "waiting");
+    if (g_api_known && g_api != reshade::api::device_api::d3d11)
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f), "v0.3 endpoint test currently targets D3D11 games only.");
 
     ImGui::Separator();
-    ImGui::TextUnformatted("Installed vs loaded DLLs");
-    ImGui::TextDisabled("FOUND = file exists on disk. LOADED = Windows has mapped it into this game process.");
+    ImGui::TextUnformatted("1. Streamline bootstrap");
+    stage_line("sl.interposer.dll found", s.interposer_found);
+    stage_line("sl.interposer.dll loaded", s.interposer_loaded);
+    stage_line("manual-hooking / frame-tagging exports resolved", s.core_exports_ready);
+    stage_line("slInit(D3D12 + DLSS-G + Reflex + PCL)", s.streamline_initialized);
+    if (!s.plugin_directory.empty())
+    {
+        const std::string plugin_dir = fg::deps::narrow(s.plugin_directory);
+        ImGui::TextDisabled("Plugin path: %s", plugin_dir.c_str());
+    }
+    draw_result("slInit", s.last_init);
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("2. Private same-GPU D3D12 DLSS-G endpoint");
+    stage_line("D3D11 game device detected; primary surface selected", s.game_d3d11_seen && g_primary_runtime.load(std::memory_order_acquire) != nullptr);
+    stage_line("same-adapter native D3D12 device created", s.endpoint_device_created);
+    stage_line("D3D12 device submitted to Streamline", s.endpoint_device_submitted);
+    stage_line("DLSS-G supported on this adapter", s.endpoint_feature_supported);
+    stage_line("DLSS-G feature/plugin loaded", s.feature_loaded);
+    stage_line("DLSS-G SetOptions/GetState resolved", s.feature_functions_ready);
+    stage_line("Reflex function resolved", s.reflex_functions_ready);
+    stage_line("PCL marker function resolved", s.pcl_functions_ready);
+    stage_line("Streamline proxy D3D12 device", s.proxy_device_ready);
+    stage_line("Streamline proxy presenting queue", s.proxy_queue_ready);
+    stage_line("native command queue resolved behind proxy", s.native_queue_resolved);
+    stage_line("Streamline proxy DXGI factory", s.proxy_factory_ready);
+    stage_line("endpoint compositor window", s.endpoint_window_ready);
+    stage_line("Streamline proxy swapchain", s.proxy_swapchain_ready);
+    stage_line("native swapchain resolved behind proxy", s.native_swapchain_resolved);
+
+    if (s.requirements_queried)
+    {
+        ImGui::Text("DLSS-G API flags: D3D11 %s | D3D12 %s | Vulkan %s",
+                    s.requirement_d3d11 ? "YES" : "no",
+                    s.requirement_d3d12 ? "YES" : "no",
+                    s.requirement_vulkan ? "YES" : "no");
+        ImGui::Text("Special requirements: HAGS %s | VSync off %s",
+                    s.requirement_hags ? "required" : "not flagged",
+                    s.requirement_vsync_off ? "required" : "not flagged");
+    }
+    draw_result("slSetD3DDevice", s.last_set_device);
+    draw_result("slIsFeatureSupported(DLSS-G)", s.last_supported);
+    draw_result("slSetFeatureLoaded(DLSS-G)", s.last_set_feature_loaded);
+    draw_result("slIsFeatureLoaded(DLSS-G)", s.last_is_loaded);
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("3. DLSS5 Feeder input provider");
+    stage_line("DLSS5_Feed.fx technique found", guides.effect_present);
+    stage_line("DLSS5_Feed.fx technique ENABLED / updating", guides.effect_enabled);
+    stage_line("DLSS5_MV texture declared", guides.motion_vectors);
+    stage_line("DLSS5_Depth texture declared", guides.depth);
+    stage_line("native D3D11 MV texture acquired", s.feeder_mv_acquired);
+    stage_line("native D3D11 depth texture acquired", s.feeder_depth_acquired);
+    stage_line("D3D11 <-> D3D12 shared color/MV/depth bridge", s.feeder_bridge_ready);
+    if (d.renodx_dlss5_loaded)
+        ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "[ OK ] your renodx-dlss5.addon64 is loaded");
+    ImGui::TextDisabled("Feeder is used for the guides. It is not responsible for the FG presentation endpoint.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("4. Per-frame DLSS-G contract");
+    stage_line("controller ready for first NVIDIA Present", s.controller_ready);
+    stage_line("frame token created", s.frame_token_ready, s.endpoint_present_attempted || fg::slhost::requested_enabled());
+    stage_line("MV/depth/HUD-less-color tags submitted", s.tags_submitted, s.endpoint_present_attempted || fg::slhost::requested_enabled());
+    stage_line("common constants submitted", s.constants_submitted, s.endpoint_present_attempted || fg::slhost::requested_enabled());
+    stage_line("Reflex low-latency enabled", s.reflex_enabled, s.endpoint_present_attempted || fg::slhost::requested_enabled());
+    stage_line("slReflexSleep called for frame token", s.reflex_sleep_called, s.endpoint_present_attempted || fg::slhost::requested_enabled());
+    stage_line("PCL markers submitted", s.pcl_markers_submitted, s.endpoint_present_attempted || fg::slhost::requested_enabled());
+    stage_line("proxy Present attempted", s.endpoint_present_attempted, fg::slhost::requested_enabled());
+    stage_line("proxy Present succeeded", s.endpoint_present_succeeded, s.endpoint_present_attempted);
+
+    if (!s.bootstrap_note.empty())
+        ImGui::TextWrapped("Current stage: %s", s.bootstrap_note.c_str());
+    if (FAILED(s.endpoint_hr))
+        ImGui::Text("Endpoint HRESULT: 0x%08X", static_cast<unsigned int>(s.endpoint_hr));
+    if (s.endpoint_present_attempted)
+        ImGui::Text("Present HRESULT: 0x%08X", static_cast<unsigned int>(s.last_present_hr));
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("REAL NVIDIA DLSS Frame Generation test");
+    bool enabled = fg::slhost::requested_enabled();
+    int multiplier = fg::slhost::requested_multiplier();
+    bool reverse_z = fg::slhost::requested_depth_inverted();
+
+    ImGui::BeginDisabled(!s.controller_ready && !enabled);
+    if (ImGui::Checkbox("Enable REAL DLSS-G endpoint (F6)", &enabled))
+        fg::slhost::request_enabled(enabled);
+    ImGui::EndDisabled();
+
+    int max_multiplier = s.max_generated_frames > 0 ? static_cast<int>(s.max_generated_frames + 1) : 2;
+    max_multiplier = std::clamp(max_multiplier, 2, 6);
+    if (ImGui::SliderInt("Frame multiplier", &multiplier, 2, max_multiplier))
+        fg::slhost::request_multiplier(multiplier);
+    if (ImGui::Checkbox("Depth is reverse-Z", &reverse_z))
+        fg::slhost::request_depth_inverted(reverse_z);
+
+    if (!s.controller_ready)
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f), "Not READY yet: the first WAIT above is the blocker.");
+    else if (!enabled)
+        ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "READY. Press F6 for the first x2 attempt.");
+    else
+        ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "FG requested. The transparent endpoint window should now cover the game while NVIDIA owns its Present path.");
+
+    ImGui::TextWrapped("First-test warning: v0.3 uses generic identity camera matrices and treats final game color as HUD-less color. This is for proving real DLSS-G execution first; image quality/UI separation comes after the endpoint is alive.");
+
+    if (ImGui::Button("Re-probe state")) fg::slhost::force_reprobe();
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh DLL state")) fg::slhost::retry_bootstrap_now();
+    ImGui::TextDisabled("A cold restart is required to retry slInit. The refresh button never calls slInit twice.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("NVIDIA state / output proof");
+    draw_dlssg_failures(s);
+    ImGui::Text("Max generated frames per real frame: %u", s.max_generated_frames);
+    ImGui::Text("Real game Present callbacks: %.1f fps", s.app_present_fps);
+    ImGui::Text("DLSS-G frames actually presented: %.1f fps", s.output_fps);
+    draw_result("slGetNewFrameToken", s.last_get_frame_token);
+    draw_result("slSetTagForFrame", s.last_set_tags);
+    draw_result("slSetConstants", s.last_set_constants);
+    draw_result("slReflexSetOptions", s.last_reflex_options);
+    draw_result("slReflexSleep", s.last_reflex_sleep);
+    draw_result("slPCLSetMarker", s.last_pcl_marker);
+    draw_result("slDLSSGSetOptions", s.last_set_options);
+    draw_result("slDLSSGGetState", s.last_get_state);
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Installed DLL visibility");
+    ImGui::TextDisabled("FOUND = exists beside game EXE (./streamline is fallback). LOADED = mapped in this process.");
     draw_dll("sl.interposer.dll", d.interposer);
     draw_dll("sl.dlss_g.dll", d.sl_dlssg);
     draw_dll("sl.reflex.dll", d.sl_reflex);
     draw_dll("sl.pcl.dll", d.sl_pcl);
     draw_dll("sl.common.dll", d.sl_common);
     draw_dll("nvngx_dlssg.dll", d.ngx_dlssg);
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Bootstrap stages");
-    stage_line("1. sl.interposer.dll found", s.interposer_found);
-    stage_line("2. sl.interposer.dll mapped into process", s.interposer_loaded);
-    stage_line("3. Streamline core exports resolved", s.core_exports_ready);
-    stage_line("4. Streamline initialized", s.streamline_initialized);
-    stage_line("5. DLSS-G feature/plugin loaded", s.feature_loaded);
-    stage_line("6. DLSS-G SetOptions/GetState resolved", s.feature_functions_ready);
-    stage_line("7. Game D3D device observed and submitted to SL", s.host_device_submitted);
-    stage_line("8. Real game swapchain is a Streamline proxy", s.swapchain_is_streamline_proxy);
-    stage_line("9. Controller armed", s.controller_ready);
-
-    if (!s.bootstrap_note.empty())
-        ImGui::TextWrapped("Current stage: %s", s.bootstrap_note.c_str());
-    if (s.load_library_error != ERROR_SUCCESS)
-        ImGui::Text("LoadLibrary Win32 error: %lu", static_cast<unsigned long>(s.load_library_error));
-    if (!s.plugin_directory.empty())
-    {
-        const std::string plugin_dir = fg::deps::narrow(s.plugin_directory);
-        ImGui::TextWrapped("Streamline plugin directory: %s", plugin_dir.c_str());
-    }
-    ImGui::Text("slInit: %s", fg::slhost::result_name(s.last_init));
-    if (s.host_device_seen)
-        ImGui::Text("Game device submitted as: %s", api_name(s.host_device_api));
-    ImGui::Text("slSetD3DDevice: %s", fg::slhost::result_name(s.last_set_device));
-    ImGui::Text("slIsFeatureLoaded(DLSS-G): %s", fg::slhost::result_name(s.last_is_loaded));
-
-    if (d.renodx_dlss5_loaded)
-        ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "[ OK ] renodx-dlss5.addon64 loaded (RenoDX DLSS5 host; version-agnostic)");
-    if (d.renodx_dlss_loaded)
-        ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "[ OK ] renodx-dlss.addon64 loaded");
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Feeder guide resources");
-    stage_line("DLSS5_Feed.fx technique found", guides.effect_present);
-    stage_line("DLSS5_MV texture found", guides.motion_vectors);
-    stage_line("DLSS5_Depth texture found", guides.depth);
-    ImGui::TextDisabled("These prove the guide data exists. 0.2 does not yet steal ownership of RenoDX's frame token/resources.");
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Real NVIDIA DLSS Frame Generation");
-    bool enabled = fg::slhost::requested_enabled();
-    int multiplier = fg::slhost::requested_multiplier();
-    ImGui::BeginDisabled(!s.controller_ready);
-    if (ImGui::Checkbox("Enable DLSS Frame Generation", &enabled)) fg::slhost::request_enabled(enabled);
-    int max_multiplier = s.max_generated_frames > 0 ? static_cast<int>(s.max_generated_frames + 1) : 4;
-    max_multiplier = std::clamp(max_multiplier, 2, 6);
-    if (ImGui::SliderInt("Frame multiplier", &multiplier, 2, max_multiplier)) fg::slhost::request_multiplier(multiplier);
-    ImGui::EndDisabled();
-
-    if (!s.controller_ready)
-        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f), "Not armed yet: the first WAIT stage above is the actual blocker.");
-
-    if (ImGui::Button("Re-probe state")) fg::slhost::force_reprobe();
-    ImGui::SameLine();
-    if (ImGui::Button("Retry DLL load (diagnostic)")) fg::slhost::retry_bootstrap_now();
-    ImGui::TextDisabled("The retry button does not call slInit late. Restart the game to retry the pre-device bootstrap safely.");
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("NVIDIA state");
-    draw_dlssg_failures(s);
-    ImGui::Text("Max generated frames / real frame: %u", s.max_generated_frames);
-    ImGui::Text("App Present callbacks: %.1f fps", s.app_present_fps);
-    ImGui::Text("DLSS-G frames actually presented: %.1f fps", s.output_fps);
-    ImGui::Text("SetOptions: %s", fg::slhost::result_name(s.last_set_options));
-    ImGui::Text("GetState: %s", fg::slhost::result_name(s.last_get_state));
 }
 
 bool on_create_device(reshade::api::device_api api, uint32_t &api_version)
@@ -253,6 +319,7 @@ void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
         g_api_known = true;
         fg::slhost::set_game_api(g_api);
     }
+    fg::slhost::on_primary_runtime(runtime);
     fg::guides::resolve(runtime);
     fg::slhost::force_reprobe();
 }
@@ -260,6 +327,7 @@ void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
 void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
 {
     if (runtime != g_primary_runtime.load(std::memory_order_acquire)) return;
+    fg::slhost::on_primary_runtime_destroyed(runtime);
     fg::guides::clear(runtime);
     g_primary_runtime.store(nullptr, std::memory_order_release);
     g_primary_area.store(0, std::memory_order_relaxed);
@@ -275,7 +343,7 @@ void on_reloaded_effects(reshade::api::effect_runtime *runtime)
 void on_reshade_present(reshade::api::effect_runtime *runtime)
 {
     if (!consider_primary_runtime(runtime)) return;
-    fg::slhost::present_tick();
+    fg::slhost::present_tick(runtime);
 }
 }
 

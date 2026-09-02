@@ -118,7 +118,6 @@ Snapshot probe()
     s.sl_common = probe_dll(L"sl.common.dll");
     s.ngx_dlssg = probe_dll(L"nvngx_dlssg.dll");
 
-    s.renodx_dlss_loaded = loaded(L"renodx-dlss.addon64");
     s.renodx_dlss5_loaded = loaded(L"renodx-dlss5.addon64");
     s.feeder_loaded = loaded(L"dlss5-feed.addon64");
     return s;
